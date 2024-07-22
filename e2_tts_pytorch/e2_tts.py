@@ -13,7 +13,7 @@ from typing import Literal, List, Callable
 from random import random
 
 import torch
-from torch import nn
+from torch import nn, from_numpy
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 from torch.nn.utils.rnn import pad_sequence
@@ -364,10 +364,17 @@ class DurationPredictor(Module):
                 cond_on_time = False
             )
 
+        # mel spec
+
+        self.mel_spec = MelSpec(**mel_spec_kwargs)
+        self.num_channels = self.mel_spec.n_mel_channels
+
         self.transformer = transformer
         dim = transformer.dim
-
         self.dim = dim
+
+        self.proj_in = nn.Linear(self.num_channels, self.dim)
+
         self.embed_text = CharacterEmbed(dim, num_embeds = text_num_embeds)
 
         self.to_pred = nn.Sequential(
@@ -375,10 +382,6 @@ class DurationPredictor(Module):
             nn.Softplus(),
             Rearrange('... 1 -> ...')
         )
-
-        # mel spec
-
-        self.mel_spec = MelSpec(**mel_spec_kwargs)
 
     def forward(
         self,
@@ -394,6 +397,8 @@ class DurationPredictor(Module):
             x = self.mel_spec(x)
             x = rearrange(x, 'b d n -> b n d')
             assert x.shape[-1] == self.dim
+
+        x = self.proj_in(x)
 
         batch, seq_len, device = *x.shape[:2], x.device
 
@@ -724,7 +729,8 @@ class E2TTS(Module):
 
         if self.immiscible:
             cost = torch.cdist(x1.flatten(1), x0.flatten(1))
-            _, reorder_indices = linear_sum_assignment(cost)
+            _, reorder_indices = linear_sum_assignment(cost.cpu())
+            reorder_indices = from_numpy(reorder_indices).to(cost.device)
             x0 = x0[reorder_indices]
 
         # t is random times from above
