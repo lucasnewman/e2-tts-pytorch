@@ -313,9 +313,9 @@ class E2Trainer:
                 mel_lengths = batch["mel_lengths"]
                 
                 if self.duration_predictor is not None:
-                    dur_loss = self.duration_predictor(mel_spec, target_duration=batch.get('durations'))
+                    dur_loss = self.duration_predictor(mel_spec, lens=batch.get('durations'))
                     # self.writer.add_scalar('duration loss', dur_loss.item(), global_step)
-                
+
                 loss, pred = self.model(mel_spec, text=text_inputs, lens=mel_lengths)
                 self.accelerator.backward(loss)
 
