@@ -19,6 +19,7 @@ from accelerate import Accelerator
 import matplotlib.pyplot as plt
 
 # from loguru import logger
+from ema_pytorch import EMA
 
 from e2_tts_pytorch.e2_tts import (
     E2TTS,
@@ -228,7 +229,8 @@ class E2Trainer:
         max_grad_norm = 1.0,
         sample_rate = 24_000,
         tensorboard_log_dir = 'runs/e2_tts_experiment',
-        accelerate_kwargs: dict = dict()
+        accelerate_kwargs: dict = dict(),
+        ema_kwargs: dict = dict()
     ):
         # logger.add(log_file)
 
@@ -238,7 +240,12 @@ class E2Trainer:
         )
 
         self.target_sample_rate = sample_rate
+
         self.model = model
+
+        if self.is_main:
+            self.ema_model = EMA(model, **ema_kwargs)
+
         self.duration_predictor = duration_predictor
         self.optimizer = optimizer
         self.num_warmup_steps = num_warmup_steps
@@ -251,10 +258,15 @@ class E2Trainer:
         
         # self.writer = SummaryWriter(log_dir=tensorboard_log_dir)
 
+    @property
+    def is_main(self):
+        return self.accelerator.is_main_process
+
     def save_checkpoint(self, step, finetune=False):
         checkpoint = dict(
             model_state_dict = self.accelerator.unwrap_model(self.model).state_dict(),
-            optimizer_state_dict = self.optimizer.state_dict(),
+            ema_model_state_dict = self.ema_model.state_dict(),
+            optimizer_state_dict = self.accelerator.unwrap_model(self.optimizer).state_dict(),
             scheduler_state_dict = self.scheduler.state_dict(),
             step = step
         )
@@ -267,7 +279,10 @@ class E2Trainer:
 
         checkpoint = torch.load(self.checkpoint_path)
         self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.accelerator.unwrap_model(self.optimizer).load_state_dict(checkpoint['optimizer_state_dict'])
+
+        self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
+
         if self.scheduler:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         return checkpoint['step']
@@ -310,6 +325,9 @@ class E2Trainer:
                 self.optimizer.step()
                 self.scheduler.step()
                 self.optimizer.zero_grad()
+
+                if self.is_main:
+                    self.ema_model.update()
                 
                 # if self.accelerator.is_local_main_process:
                     # print(f"step {global_step+1}: loss = {loss.item():.4f}")
