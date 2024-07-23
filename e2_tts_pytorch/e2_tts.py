@@ -8,6 +8,7 @@ d - dimension
 """
 
 from __future__ import annotations
+from functools import partial
 from typing import Literal, List, Callable
 from random import random
 
@@ -18,13 +19,17 @@ from torch.nn import Module, ModuleList
 from torch.nn.utils.rnn import pad_sequence
 
 import torchaudio
+
+import torchode as to
 from torchdiffeq import odeint
 
 import einx
-from einops import einsum, rearrange, repeat, reduce
+from einops import einsum, rearrange, repeat, reduce, pack, unpack
 from einops.layers.torch import Rearrange
 
 from scipy.optimize import linear_sum_assignment
+
+import matplotlib.pyplot as plt
 
 from x_transformers import (
     Attention,
@@ -53,6 +58,12 @@ def default(v, d):
 
 def divisible_by(num, den):
     return (num % den) == 0
+
+def pack_one(t, pattern):
+    return pack([t], pattern)
+
+def unpack_one(t, ps, pattern):
+    return unpack(t, ps, pattern)[0]
 
 # simple utf-8 tokenizer, since paper went character based
 
@@ -103,28 +114,26 @@ class MelSpec(Module):
         filter_length = 1024,
         hop_length = 256,
         win_length = 1024,
-        n_mel_channels = 80,
-        mel_fmin = 0,
-        mel_fmax = 8000,
-        sampling_rate = 22050,
+        n_mel_channels = 100,
+        sampling_rate = 24_000,
         normalize = False,
-        power = 2,
-        norm = "slaney"
+        power = 1,
+        norm = None,
+        center = True,
     ):
         super().__init__()
         self.n_mel_channels = n_mel_channels
 
         self.mel_stft = torchaudio.transforms.MelSpectrogram(
-            n_fft=filter_length,
-            hop_length=hop_length,
-            win_length=win_length,
-            power=power,
-            normalized=normalize,
-            sample_rate=sampling_rate,
-            f_min=mel_fmin,
-            f_max=mel_fmax,
-            n_mels=n_mel_channels,
-            norm=norm,
+            sample_rate = sampling_rate,
+            n_fft = filter_length,
+            win_length = win_length,
+            hop_length = hop_length,
+            n_mels = n_mel_channels,
+            power = power,
+            center = center,
+            normalized = normalize,
+            norm = norm,
         )
 
         self.register_buffer('dummy', torch.tensor(0), persistent = False)
@@ -582,14 +591,19 @@ class E2TTS(Module):
 
         # neural ode
 
-        def fn(t, x):
+        def fn(t, x, *, packed_shape = None):
+            if exists(packed_shape):
+                x = unpack_one(x, packed_shape, 'b *')
+
             # at each step, conditioning is fixed
 
             x = torch.where(cond_mask[..., None], cond, x)
 
             # predict flow
 
-            return self.cfg_transformer_with_pred_head(
+            print(f"predicting flow for time: {t}")
+
+            out = self.cfg_transformer_with_pred_head(
                 x,
                 times = t,
                 text = text,
@@ -597,11 +611,51 @@ class E2TTS(Module):
                 cfg_strength = cfg_strength
             )
 
+            if exists(packed_shape):
+                out = rearrange(out, 'b ... -> b (...)')
+
+            # visualize the mel spectrogram
+            sampled_mel = out[0, :].detach().cpu()
+            rearranged_mel = rearrange(sampled_mel, 'd n -> n d')
+            
+            plt.figure(figsize=(12, 4))
+            plt.imshow(rearranged_mel.numpy(), origin='lower', aspect='auto')
+            plt.colorbar()
+            plt.show()
+            
+            return out
+
         y0 = torch.randn_like(cond)
         t = torch.linspace(0, 1, steps, device = self.device)
+        print(f"steps: {steps}, t: {t}")
 
-        trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
-        sampled = trajectory[-1]
+        if True:
+            trajectory = odeint(fn, y0, t, options = dict(), **self.odeint_kwargs)
+            sampled = trajectory[-1]
+        else:
+            t = repeat(t, 'n -> b n', b = batch)
+            y0, packed_shape = pack_one(y0, 'b *')
+
+            fn = partial(fn, packed_shape = packed_shape)
+
+            term = to.ODETerm(fn)
+            step_method = to.Tsit5(term = term)
+
+            step_size_controller = to.IntegralController(
+                atol = self.odeint_kwargs['atol'],
+                rtol = self.odeint_kwargs['rtol'],
+                term = term
+            )
+
+            solver = to.AutoDiffAdjoint(step_method, step_size_controller)
+            jit_solver = torch.compile(solver)
+
+            init_value = to.InitialValueProblem(y0 = y0, t_eval = t)
+
+            sol = jit_solver.solve(init_value)
+
+            sampled = sol.ys[:, -1]
+            sampled = unpack_one(sampled, packed_shape, 'b *')
 
         out = sampled
 
@@ -700,4 +754,4 @@ class E2TTS(Module):
 
         loss = loss[rand_span_mask]
 
-        return loss.mean()
+        return loss.mean(), pred.detach()
