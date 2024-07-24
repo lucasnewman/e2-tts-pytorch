@@ -219,8 +219,6 @@ class CharacterEmbed(Module):
             # todo: fix
             pass
         
-        # print(f"x: {x.shape}, mask: {mask.shape}, text_embed: {text_embed.shape}")
-        
         cond = torch.where(
             mask[..., None],
             x,
@@ -233,10 +231,7 @@ class CharacterEmbed(Module):
             0.
         )
         
-        # print(f"mask: {mask[0, ...]}")
-        # print(f"cond: {cond[0, ...]}")
-        # print(f"w: {w[0, ...]}")
-        print(f"cond: {cond.shape}, w: {w.shape}, text_embed: {text_embed.shape}")
+        # print(f"cond: {cond.shape}, w: {w.shape}, text_embed: {text_embed.shape}")
         
         concatted = torch.cat((cond, w, text_embed), dim = -1)
         # assert x.shape[-1] == text_embed.shape[-1] == self.dim, f'expected {self.dim} but received ({x.shape[-1]}, {text_embed.shape[-1]})'

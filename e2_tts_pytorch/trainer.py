@@ -330,7 +330,7 @@ class E2Trainer:
                         dur_loss = self.duration_predictor(mel_spec, lens=batch.get('durations'))
                         self.writer.add_scalar('duration loss', dur_loss.item(), global_step)
 
-                    loss, pred = self.model(mel_spec, text=text_inputs, lens=mel_lengths)
+                    loss, pred, mask = self.model(mel_spec, text=text_inputs, lens=mel_lengths)
                     self.accelerator.backward(loss)
 
                     if self.max_grad_norm > 0:
@@ -343,7 +343,7 @@ class E2Trainer:
                 # if self.is_main:
                 #     self.ema_model.update()
                     
-                if global_step % 2 == 0:
+                if global_step % 100 == 0:
                     predicted = rearrange(pred[0, :].cpu(), 'n d -> d n')
                     
                     mask = rearrange(mask[0, :].cpu(), 'n -> 1 n')
@@ -351,11 +351,16 @@ class E2Trainer:
                     mask = mask.astype('float32')
                     mask = mask * 0.5
                     
+                    # visualize the mask
+                    plt.figure(figsize=(12, 4))
+                    plt.imshow(mask, origin='lower', aspect='auto', alpha=0.5)
+                    plt.colorbar()
+                    plt.show()
+                    
                     # visualize the mel spectrogram
                     plt.figure(figsize=(12, 4))
                     plt.imshow(predicted.numpy(), origin='lower', aspect='auto')
                     plt.colorbar()
-                    plt.imshow(mask, origin='lower', aspect='auto', alpha=0.5)
                     plt.show()
                     
                     expected = rearrange(mel_spec[0, :].cpu(), 'n d -> d n')
@@ -364,7 +369,6 @@ class E2Trainer:
                     plt.figure(figsize=(12, 4))
                     plt.imshow(expected.numpy(), origin='lower', aspect='auto')
                     plt.colorbar()
-                    # plt.imshow(mask, origin='lower', aspect='auto', alpha=0.2)
                     plt.show()
 
                 # if self.accelerator.is_local_main_process:
