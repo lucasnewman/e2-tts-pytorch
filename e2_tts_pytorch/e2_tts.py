@@ -20,11 +20,10 @@ from torch.nn.utils.rnn import pad_sequence
 
 import torchaudio
 
-import torchode as to
 from torchdiffeq import odeint
 
 import einx
-from einops import einsum, rearrange, repeat, reduce, pack, unpack
+from einops import einsum, rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 
 from scipy.optimize import linear_sum_assignment
@@ -59,12 +58,6 @@ def default(v, d):
 def divisible_by(num, den):
     return (num % den) == 0
 
-def pack_one(t, pattern):
-    return pack([t], pattern)
-
-def unpack_one(t, ps, pattern):
-    return unpack(t, ps, pattern)[0]
-
 # simple utf-8 tokenizer, since paper went character based
 
 def list_str_to_tensor(
@@ -91,6 +84,40 @@ def lens_to_mask(
 
     seq = torch.arange(length, device = t.device)
     return einx.less('n, b -> b n', seq, t)
+
+def mask_from_start_end_indices(
+    seq_len: Int['b'],
+    start: Int['b'],
+    end: Int['b']
+):
+    assert start.shape == end.shape
+    assert seq_len.shape[0] == start.shape[0]
+    device = start.device
+    
+    batch_size = start.shape[0]
+    max_seq_len = seq_len.max().item()
+    
+    seq = torch.arange(max_seq_len, device=device, dtype=torch.long)
+    seq = seq.unsqueeze(0).expand(batch_size, -1)
+    
+    mask = seq >= start[:, None].long()
+    mask &= seq < end[:, None].long()
+    return mask
+
+def mask_from_frac_lengths(
+    seq_len: Int['b'],
+    frac_lengths: Float['b']
+):
+    device = frac_lengths.device
+
+    lengths = (frac_lengths * seq_len).long()
+    max_start = seq_len - lengths
+
+    rand = torch.zeros_like(frac_lengths, device=device).uniform_(0, 1)
+    start = (max_start * rand).long().clamp(min=0)
+    end = start + lengths
+
+    return mask_from_start_end_indices(seq_len, start, end)
 
 def maybe_masked_mean(
     t: Float['b n d'],
@@ -163,13 +190,14 @@ class CharacterEmbed(Module):
         super().__init__()
         self.dim = dim
         self.embed = nn.Embedding(num_embeds + 1, dim) # will just use 0 as the 'filler token'
-        self.combine = nn.Linear(dim * 2, dim)
+        self.combine = nn.Linear(dim * 3, dim)
         self.cond_drop_prob = cond_drop_prob
 
     def forward(
         self,
         x: Float['b n d'],
         text: Int['b n'],
+        mask: Bool['b n'] | None = None,
         drop_text_cond = None
     ):
         drop_text_cond = default(drop_text_cond, self.training and random() < self.cond_drop_prob)
@@ -178,17 +206,39 @@ class CharacterEmbed(Module):
             return x
 
         max_seq_len = x.shape[1]
-        text_mask = text == -1
 
         text = text + 1 # use 0 as filler token
-        text = text.masked_fill(text_mask, 0)
 
         text = text[:, :max_seq_len] # just curtail if character tokens are more than the mel spec tokens, one of the edge cases the paper did not address
         text = F.pad(text, (0, max_seq_len - text.shape[1]), value = 0)
+ 
         text_embed = self.embed(text)
-
-        concatted = torch.cat((x, text_embed), dim = -1)
-        assert x.shape[-1] == text_embed.shape[-1] == self.dim, f'expected {self.dim} but received ({x.shape[-1]}, {text_embed.shape[-1]})'
+        
+        if not exists(mask):
+            # todo: fix
+            pass
+        
+        # print(f"x: {x.shape}, mask: {mask.shape}, text_embed: {text_embed.shape}")
+        
+        cond = torch.where(
+            mask[..., None],
+            x,
+            0.
+        )
+        
+        w = torch.where(
+            ~mask[..., None],
+            x,
+            0.
+        )
+        
+        # print(f"mask: {mask[0, ...]}")
+        # print(f"cond: {cond[0, ...]}")
+        # print(f"w: {w[0, ...]}")
+        print(f"cond: {cond.shape}, w: {w.shape}, text_embed: {text_embed.shape}")
+        
+        concatted = torch.cat((cond, w, text_embed), dim = -1)
+        # assert x.shape[-1] == text_embed.shape[-1] == self.dim, f'expected {self.dim} but received ({x.shape[-1]}, {text_embed.shape[-1]})'
         return self.combine(concatted)
 
 # attention and transformer backbone
@@ -459,7 +509,8 @@ class E2TTS(Module):
         cond_drop_prob = 0.25,
         mel_spec_module: Module | None = None,
         mel_spec_kwargs: dict = dict(),
-        immiscible = False
+        immiscible = False,
+        frac_lengths_mask: Tuple[float, float] = (0.7, 1.),
     ):
         super().__init__()
 
@@ -476,6 +527,8 @@ class E2TTS(Module):
 
         dim = transformer.dim
         self.dim = dim
+
+        self.frac_lengths_mask = frac_lengths_mask
 
         self.embed_text = CharacterEmbed(dim, num_embeds = text_num_embeds, cond_drop_prob = cond_drop_prob)
 
@@ -518,7 +571,7 @@ class E2TTS(Module):
         x = self.proj_in(x)
 
         if exists(text):
-            x = self.embed_text(x, text, drop_text_cond = drop_text_cond)
+            x = self.embed_text(x, text, mask, drop_text_cond = drop_text_cond)
 
         attended = self.transformer(
             x,
@@ -600,17 +653,14 @@ class E2TTS(Module):
 
         # neural ode
 
-        def fn(t, x, *, packed_shape = None):
-            if exists(packed_shape):
-                x = unpack_one(x, packed_shape, 'b *')
-
+        def fn(t, x):
             # at each step, conditioning is fixed
 
             x = torch.where(cond_mask, cond, x)
 
             # predict flow
 
-            print(f"predicting flow for time: {t}")
+            print(f"predicting flow for time: {t}, text: {text}, cfg_strength: {cfg_strength}")
 
             out = self.cfg_transformer_with_pred_head(
                 x,
@@ -619,9 +669,6 @@ class E2TTS(Module):
                 mask = mask,
                 cfg_strength = cfg_strength
             )
-
-            if exists(packed_shape):
-                out = rearrange(out, 'b ... -> b (...)')
 
             # visualize the mel spectrogram
             sampled_mel = out[0, :].detach().cpu()
@@ -638,33 +685,8 @@ class E2TTS(Module):
         t = torch.linspace(0, 1, steps, device = self.device)
         print(f"steps: {steps}, t: {t}")
 
-        if True:
-            trajectory = odeint(fn, y0, t, options = dict(), **self.odeint_kwargs)
-            sampled = trajectory[-1]
-        else:
-            t = repeat(t, 'n -> b n', b = batch)
-            y0, packed_shape = pack_one(y0, 'b *')
-
-            fn = partial(fn, packed_shape = packed_shape)
-
-            term = to.ODETerm(fn)
-            step_method = to.Tsit5(term = term)
-
-            step_size_controller = to.IntegralController(
-                atol = self.odeint_kwargs['atol'],
-                rtol = self.odeint_kwargs['rtol'],
-                term = term
-            )
-
-            solver = to.AutoDiffAdjoint(step_method, step_size_controller)
-            jit_solver = torch.compile(solver)
-
-            init_value = to.InitialValueProblem(y0 = y0, t_eval = t)
-
-            sol = jit_solver.solve(init_value)
-
-            sampled = sol.ys[:, -1]
-            sampled = unpack_one(sampled, packed_shape, 'b *')
+        trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
+        sampled = trajectory[-1]
 
         out = sampled
 
@@ -708,16 +730,8 @@ class E2TTS(Module):
 
         # get a random span to mask out for training conditionally
 
-        random_span_frac_indices = inp.new_zeros(2, batch).uniform_(0, 1)
-        rand_span_indices = (random_span_frac_indices * default(lens, seq_len)).long()
-        rand_span_indices = rand_span_indices.sort(dim = 0).values
-
-        seq = torch.arange(seq_len, device = device)
-        start, end = rand_span_indices[..., None]
-        rand_span_mask = (seq >= start) & (seq <= end)
-
-        if exists(mask):
-            rand_span_mask &= mask
+        frac_lengths = torch.zeros((batch,), device = self.device).float().uniform_(*self.frac_lengths_mask)
+        rand_span_mask = mask_from_frac_lengths(lens, frac_lengths)
 
         # mel is x1
 
@@ -758,12 +772,12 @@ class E2TTS(Module):
 
         # transformer and prediction head
 
-        pred = self.transformer_with_pred_head(w, times = times, text = text)
-
+        pred = self.transformer_with_pred_head(w, mask = rand_span_mask, times = times, text = text)
+        
         # flow matching loss
 
         loss = F.mse_loss(pred, flow, reduction = 'none')
 
         loss = loss[rand_span_mask]
 
-        return loss.mean(), pred.detach()
+        return loss.mean(), pred.detach(), rand_span_mask
