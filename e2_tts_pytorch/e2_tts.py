@@ -97,7 +97,7 @@ def mask_from_start_end_indices(
     batch_size = start.shape[0]
     max_seq_len = seq_len.max().item()
     
-    seq = torch.arange(max_seq_len, device=device, dtype=torch.long)
+    seq = torch.arange(max_seq_len, device = device, dtype = torch.long)
     seq = seq.unsqueeze(0).expand(batch_size, -1)
     
     mask = seq >= start[:, None].long()
@@ -113,8 +113,8 @@ def mask_from_frac_lengths(
     lengths = (frac_lengths * seq_len).long()
     max_start = seq_len - lengths
 
-    rand = torch.zeros_like(frac_lengths, device=device).uniform_(0, 1)
-    start = (max_start * rand).long().clamp(min=0)
+    rand = torch.zeros_like(frac_lengths, device = device).uniform_(0, 1)
+    start = (max_start * rand).long().clamp(min = 0)
     end = start + lengths
 
     return mask_from_start_end_indices(seq_len, start, end)
@@ -134,6 +134,7 @@ def maybe_masked_mean(
     return einx.divide('b d, b -> b d', num, den.clamp(min = 1.))
 
 # to mel spec
+
 
 class MelSpec(Module):
     def __init__(
@@ -207,7 +208,7 @@ class CharacterEmbed(Module):
 
         max_seq_len = x.shape[1]
 
-        text = text + 1 # use 0 as filler token
+        text = text + 1 # shift all other token ids up by 1 and use 0 as filler token
 
         text = text[:, :max_seq_len] # just curtail if character tokens are more than the mel spec tokens, one of the edge cases the paper did not address
         text = F.pad(text, (0, max_seq_len - text.shape[1]), value = 0)
@@ -404,6 +405,7 @@ class DurationPredictor(Module):
         self,
         transformer: dict | Transformer,
         text_num_embeds = 256,
+        num_channels = None,
         mel_spec_kwargs: dict = dict()
     ):
         super().__init__()
@@ -417,7 +419,7 @@ class DurationPredictor(Module):
         # mel spec
 
         self.mel_spec = MelSpec(**mel_spec_kwargs)
-        self.num_channels = self.mel_spec.n_mel_channels
+        self.num_channels = default(num_channels, self.mel_spec.n_mel_channels)
 
         self.transformer = transformer
         dim = transformer.dim
@@ -507,10 +509,11 @@ class E2TTS(Module):
         ),
         text_num_embeds = 256,
         cond_drop_prob = 0.25,
+        num_channels = None,
         mel_spec_module: Module | None = None,
         mel_spec_kwargs: dict = dict(),
         immiscible = False,
-        frac_lengths_mask: Tuple[float, float] = (0.7, 1.),
+        frac_lengths_mask: Tuple[float, float] = (0.7, 1.)
     ):
         super().__init__()
 
@@ -545,7 +548,7 @@ class E2TTS(Module):
         # mel spec
 
         self.mel_spec = default(mel_spec_module, MelSpec(**mel_spec_kwargs))
-        num_channels = self.mel_spec.n_mel_channels
+        num_channels = default(num_channels, self.mel_spec.n_mel_channels)
  
         self.num_channels = num_channels
 
@@ -732,6 +735,9 @@ class E2TTS(Module):
 
         frac_lengths = torch.zeros((batch,), device = self.device).float().uniform_(*self.frac_lengths_mask)
         rand_span_mask = mask_from_frac_lengths(lens, frac_lengths)
+
+        if exists(mask):
+            rand_span_mask &= mask
 
         # mel is x1
 
