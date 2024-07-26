@@ -216,22 +216,34 @@ class CharacterEmbed(Module):
         text_embed = self.embed(text)
         
         if not exists(mask):
-            # todo: fix
-            pass
+            mask = torch.ones_like(text, dtype = torch.bool)
         
-        cond = torch.where(
+        if drop_text_cond:
+            cond = torch.zeros_like(x)
+        else:
+            cond = torch.where(
+                ~mask[..., None],
+                x,
+                0.
+            )
+        
+        w = torch.where(
             mask[..., None],
             x,
             0.
         )
         
-        w = torch.where(
-            ~mask[..., None],
-            x,
-            0.
-        )
+        # cond_viz = rearrange(cond[0, ...].detach().cpu(), 'n d -> d n')
+        # plt.figure(figsize=(12, 4))
+        # plt.imshow(cond_viz.numpy(), origin='lower', aspect='auto')
+        # plt.colorbar()
+        # plt.show()
         
-        # print(f"cond: {cond.shape}, w: {w.shape}, text_embed: {text_embed.shape}")
+        # w_viz = rearrange(w[0, ...].detach().cpu(), 'n d -> d n')
+        # plt.figure(figsize=(12, 4))
+        # plt.imshow(w_viz.numpy(), origin='lower', aspect='auto')
+        # plt.colorbar()
+        # plt.show()
         
         concatted = torch.cat((cond, w, text_embed), dim = -1)
         # assert x.shape[-1] == text_embed.shape[-1] == self.dim, f'expected {self.dim} but received ({x.shape[-1]}, {text_embed.shape[-1]})'
@@ -630,7 +642,10 @@ class E2TTS(Module):
         if not exists(lens):
             lens = torch.full((batch,), cond_seq_len, device = device, dtype = torch.long)
 
-        cond_mask = lens_to_mask(lens)
+        # cond_mask = lens_to_mask(lens)
+        frac_lengths = torch.zeros((batch,), device = device).float().uniform_(0.25, 0.35)
+        cond_mask = ~mask_from_frac_lengths(lens, frac_lengths)
+        print(f"cond_mask: {cond_mask}")
 
         if exists(duration):
             if isinstance(duration, int):
