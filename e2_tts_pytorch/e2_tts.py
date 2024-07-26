@@ -190,15 +190,18 @@ class CharacterEmbed(Module):
     ):
         super().__init__()
         self.dim = dim
-        self.embed = nn.Embedding(num_embeds + 1, dim) # will just use 0 as the 'filler token'
-        self.combine = nn.Linear(dim * 3, dim)
         self.cond_drop_prob = cond_drop_prob
+
+        self.embed = nn.Embedding(num_embeds + 1, dim) # will just use 0 as the 'filler token'
+        self.to_cond_gamma_beta = nn.Linear(dim * 2, dim * 2)
+
+        nn.init.zeros_(self.to_cond_gamma_beta.weight)
+        nn.init.zeros_(self.to_cond_gamma_beta.bias)
 
     def forward(
         self,
         x: Float['b n d'],
         text: Int['b n'],
-        mask: Bool['b n'] | None = None,
         drop_text_cond = None
     ):
         drop_text_cond = default(drop_text_cond, self.training and random() < self.cond_drop_prob)
@@ -214,40 +217,12 @@ class CharacterEmbed(Module):
         text = F.pad(text, (0, max_seq_len - text.shape[1]), value = 0)
  
         text_embed = self.embed(text)
-        
-        if not exists(mask):
-            mask = torch.ones_like(text, dtype = torch.bool)
-        
-        if drop_text_cond:
-            cond = torch.zeros_like(x)
-        else:
-            cond = torch.where(
-                ~mask[..., None],
-                x,
-                0.
-            )
-        
-        w = torch.where(
-            mask[..., None],
-            x,
-            0.
-        )
-        
-        # cond_viz = rearrange(cond[0, ...].detach().cpu(), 'n d -> d n')
-        # plt.figure(figsize=(12, 4))
-        # plt.imshow(cond_viz.numpy(), origin='lower', aspect='auto')
-        # plt.colorbar()
-        # plt.show()
-        
-        # w_viz = rearrange(w[0, ...].detach().cpu(), 'n d -> d n')
-        # plt.figure(figsize=(12, 4))
-        # plt.imshow(w_viz.numpy(), origin='lower', aspect='auto')
-        # plt.colorbar()
-        # plt.show()
-        
-        concatted = torch.cat((cond, w, text_embed), dim = -1)
-        # assert x.shape[-1] == text_embed.shape[-1] == self.dim, f'expected {self.dim} but received ({x.shape[-1]}, {text_embed.shape[-1]})'
-        return self.combine(concatted)
+
+        concatted = torch.cat((x, text_embed), dim = -1)
+        assert x.shape[-1] == text_embed.shape[-1] == self.dim, f'expected {self.dim} but received ({x.shape[-1]}, {text_embed.shape[-1]})'
+
+        gamma, beta = self.to_cond_gamma_beta(concatted).chunk(2, dim = -1)
+        return x * (gamma + 1.) + beta
 
 # attention and transformer backbone
 # for use in both e2tts as well as duration module
@@ -581,7 +556,7 @@ class E2TTS(Module):
         x = self.proj_in(x)
 
         if exists(text):
-            x = self.embed_text(x, text, mask, drop_text_cond = drop_text_cond)
+            x = self.embed_text(x, text, drop_text_cond = drop_text_cond)
 
         attended = self.transformer(
             x,
@@ -788,7 +763,7 @@ class E2TTS(Module):
 
         # transformer and prediction head
 
-        pred = self.transformer_with_pred_head(w, mask = rand_span_mask, times = times, text = text)
+        pred = self.transformer_with_pred_head(w, times = times, text = text)
         
         # flow matching loss
 

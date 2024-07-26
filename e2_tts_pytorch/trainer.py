@@ -272,20 +272,18 @@ class E2Trainer:
     def is_main(self):
         return self.accelerator.is_main_process
 
-    @property
-    def is_main(self):
-        return self.accelerator.is_main_process
-
     def save_checkpoint(self, step, finetune=False):
-        checkpoint = dict(
-            model_state_dict = self.accelerator.unwrap_model(self.model).state_dict(),
-            # ema_model_state_dict = self.ema_model.state_dict(),
-            optimizer_state_dict = self.accelerator.unwrap_model(self.optimizer).state_dict(),
-            scheduler_state_dict = self.scheduler.state_dict(),
-            step = step
-        )
+        self.accelerator.wait_for_everyone()
+        if self.is_main:
+            checkpoint = dict(
+                model_state_dict = self.accelerator.unwrap_model(self.model).state_dict(),
+                optimizer_state_dict = self.accelerator.unwrap_model(self.optimizer).state_dict(),
+                ema_model_state_dict = self.ema_model.state_dict(),
+                scheduler_state_dict = self.scheduler.state_dict(),
+                step = step
+            )
 
-        torch.save(checkpoint, f"e2tts_{step}.pt")
+            self.accelerator.save(checkpoint, self.checkpoint_path)
 
     def load_checkpoint(self):
         if not exists(self.checkpoint_path) or not os.path.exists(self.checkpoint_path):
@@ -295,7 +293,8 @@ class E2Trainer:
         self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint['model_state_dict'])
         self.accelerator.unwrap_model(self.optimizer).load_state_dict(checkpoint['optimizer_state_dict'])
 
-        # self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
+        if self.is_main:
+            self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
 
         if self.scheduler:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
