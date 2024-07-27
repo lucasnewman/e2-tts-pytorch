@@ -205,7 +205,7 @@ class TextAudioDataset(Dataset):
         # mel_spec = self.mel_spectrogram(audio_tensor)
         # mel_spec = rearrange(mel_spec, '1 d t -> d t')
         
-        mel_spec = torch.load(file.with_suffix('.mel'))
+        mel_spec = torch.load(file.with_suffix('.mel'), weights_only = True)
         
         # load the text file with .normalized.txt as the extension
         # text_file = file.with_suffix('.normalized.txt')
@@ -223,7 +223,7 @@ class E2Trainer:
         self,
         model: E2TTS,
         optimizer,
-        num_warmup_steps=20000,
+        num_warmup_steps = 20000,
         grad_accumulation_steps=1,
         duration_predictor: DurationPredictor | None = None,
         checkpoint_path = None,
@@ -237,7 +237,6 @@ class E2Trainer:
         # logger.add(log_file)
 
         self.accelerator = Accelerator(
-            log_with="all",
             gradient_accumulation_steps=grad_accumulation_steps,
             **accelerate_kwargs
         )
@@ -246,14 +245,14 @@ class E2Trainer:
 
         self.model = model
 
-        # if self.is_main:
-        #     self.ema_model = EMA(
-        #         model,
-        #         include_online_model = False,
-        #         **ema_kwargs
-        #     )
+        if self.is_main:
+            self.ema_model = EMA(
+                model,
+                include_online_model = False,
+                **ema_kwargs
+            )
 
-        #     self.ema_model.to(self.accelerator.device)
+            self.ema_model.to(self.accelerator.device)
 
         self.duration_predictor = duration_predictor
         self.optimizer = optimizer
@@ -301,7 +300,6 @@ class E2Trainer:
         return checkpoint['step']
 
     def train(self, train_dataset, epochs, batch_size, num_workers=12, save_step=1000):
-
         train_dataloader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=collate_fn, shuffle=True, num_workers=num_workers, pin_memory=True)
         total_steps = len(train_dataloader) * epochs
         decay_steps = total_steps - self.num_warmup_steps
@@ -313,6 +311,16 @@ class E2Trainer:
         train_dataloader, self.scheduler = self.accelerator.prepare(train_dataloader, self.scheduler)
         start_step = 0 # self.load_checkpoint()
         global_step = start_step
+        
+        print("Starting training...")
+        
+        hps = {
+            "epochs": epochs,
+            "num_warmup_steps": self.num_warmup_steps,
+            "max_grad_norm": self.max_grad_norm,
+            "batch_size": batch_size,
+        }
+        self.accelerator.init_trackers("e2tts", config=hps)
 
         for epoch in range(epochs):
             self.model.train()
@@ -329,7 +337,7 @@ class E2Trainer:
                         dur_loss = self.duration_predictor(mel_spec, lens=batch.get('durations'))
                         self.writer.add_scalar('duration loss', dur_loss.item(), global_step)
 
-                    loss, pred, mask = self.model(mel_spec, text=text_inputs, lens=mel_lengths)
+                    loss, pred, mask, flow = self.model(mel_spec, text=text_inputs, lens=mel_lengths)
                     self.accelerator.backward(loss)
 
                     if self.max_grad_norm > 0:
@@ -339,9 +347,11 @@ class E2Trainer:
                     self.scheduler.step()
                     self.optimizer.zero_grad()
 
-                # if self.is_main:
-                #     self.ema_model.update()
-                    
+                if self.is_main:
+                    self.ema_model.update()
+
+                self.accelerator.log({'loss': loss.item(), 'lr': self.scheduler.get_last_lr()[0]}, step = global_step)
+
                 if global_step % 100 == 0:
                     predicted = rearrange(pred[0, :].cpu(), 'n d -> d n')
                     
@@ -362,7 +372,7 @@ class E2Trainer:
                     plt.colorbar()
                     plt.show()
                     
-                    expected = rearrange(mel_spec[0, :].cpu(), 'n d -> d n')
+                    expected = rearrange(flow[0, :].cpu(), 'n d -> d n')
                     
                     # visualize the mel spectrogram
                     plt.figure(figsize=(12, 4))
@@ -370,11 +380,6 @@ class E2Trainer:
                     plt.colorbar()
                     plt.show()
 
-                # if self.accelerator.is_local_main_process:
-                #     logger.info(f"step {global_step+1}: loss = {loss.item():.4f}")
-                #     self.writer.add_scalar('loss', loss.item(), global_step)
-                #     self.writer.add_scalar("lr", self.scheduler.get_last_lr()[0], global_step)
-                
                 global_step += 1
                 epoch_loss += loss.item()
                 progress_bar.set_postfix(loss=loss.item())
@@ -385,6 +390,8 @@ class E2Trainer:
             epoch_loss /= len(train_dataloader)
             if self.accelerator.is_local_main_process:
                 print(f"epoch {epoch+1}/{epochs} - average loss = {epoch_loss:.4f}")
-                # self.writer.add_scalar('epoch average loss', epoch_loss, epoch)
+                self.accelerator.log({'epoch average loss': epoch_loss}, step = global_step)
+        
+        self.accelerator.end_training()
         
         # self.writer.close()
