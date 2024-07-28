@@ -15,7 +15,7 @@ from random import random
 import torch
 from torch import nn, from_numpy
 import torch.nn.functional as F
-from torch.nn import Module, ModuleList
+from torch.nn import Module, ModuleList, Sequential, Linear
 from torch.nn.utils.rnn import pad_sequence
 
 import torchaudio
@@ -25,8 +25,6 @@ from torchdiffeq import odeint
 import einx
 from einops import einsum, rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
-
-from scipy.optimize import linear_sum_assignment
 
 import matplotlib.pyplot as plt
 
@@ -90,30 +88,18 @@ def mask_from_start_end_indices(
     start: Int['b'],
     end: Int['b']
 ):
-    assert start.shape == end.shape
-    assert seq_len.shape[0] == start.shape[0]
-    device = start.device
-    
-    batch_size = start.shape[0]
-    max_seq_len = seq_len.max().item()
-    
-    seq = torch.arange(max_seq_len, device = device, dtype = torch.long)
-    seq = seq.unsqueeze(0).expand(batch_size, -1)
-    
-    mask = seq >= start[:, None].long()
-    mask &= seq < end[:, None].long()
-    return mask
+    max_seq_len = seq_len.max().item()  
+    seq = torch.arange(max_seq_len, device = start.device).long()
+    return einx.greater_equal('n, b -> b n', seq, start) & einx.less('n, b -> b n', seq, end)
 
 def mask_from_frac_lengths(
     seq_len: Int['b'],
     frac_lengths: Float['b']
 ):
-    device = frac_lengths.device
-
     lengths = (frac_lengths * seq_len).long()
     max_start = seq_len - lengths
 
-    rand = torch.zeros_like(frac_lengths, device = device).uniform_(0, 1)
+    rand = torch.rand_like(frac_lengths)
     start = (max_start * rand).long().clamp(min = 0)
     end = start + lengths
 
@@ -134,7 +120,6 @@ def maybe_masked_mean(
     return einx.divide('b d, b -> b d', num, den.clamp(min = 1.))
 
 # to mel spec
-
 
 class MelSpec(Module):
     def __init__(
@@ -186,14 +171,18 @@ class CharacterEmbed(Module):
         self,
         dim,
         num_embeds = 256,
-        cond_drop_prob = 0.
+        cond_drop_prob = 0.,
+        num_gateloop_layers = 0
     ):
         super().__init__()
         self.dim = dim
         self.cond_drop_prob = cond_drop_prob
 
         self.embed = nn.Embedding(num_embeds + 1, dim) # will just use 0 as the 'filler token'
-        self.to_cond_gamma_beta = nn.Linear(dim * 3, dim * 2)
+
+        self.gateloops = ModuleList([Sequential(Linear(dim * 3, dim * 3, bias = False), SimpleGateLoopLayer(dim = dim * 3)) for _ in range(num_gateloop_layers)])
+
+        self.to_cond_gamma_beta = Linear(dim * 3, dim * 2)
 
         nn.init.zeros_(self.to_cond_gamma_beta.weight)
         nn.init.zeros_(self.to_cond_gamma_beta.bias)
@@ -216,10 +205,14 @@ class CharacterEmbed(Module):
 
         text = text[:, :max_seq_len] # just curtail if character tokens are more than the mel spec tokens, one of the edge cases the paper did not address
         text = F.pad(text, (0, max_seq_len - text.shape[1]), value = 0)
- 
+
         text_embed = self.embed(text)
 
         concatted = torch.cat((x, cond, text_embed), dim = -1)
+
+        for gateloop in self.gateloops:
+            concatted = gateloop(concatted) + concatted
+
         assert x.shape[-1] == text_embed.shape[-1] == self.dim, f'expected {self.dim} but received ({x.shape[-1]}, {text_embed.shape[-1]})'
 
         gamma, beta = self.to_cond_gamma_beta(concatted).chunk(2, dim = -1)
@@ -280,9 +273,9 @@ class Transformer(Module):
         self.time_cond_mlp = nn.Identity()
 
         if cond_on_time:
-            self.time_cond_mlp = nn.Sequential(
+            self.time_cond_mlp = Sequential(
                 Rearrange('... -> ... 1'),
-                nn.Linear(1, dim),
+                Linear(1, dim),
                 nn.SiLU()
             )
 
@@ -293,7 +286,7 @@ class Transformer(Module):
             ff_norm = rmsnorm_klass(dim)
             ff = FeedForward(dim = dim, glu = True, dropout = dropout, **ff_kwargs)
 
-            skip_proj = nn.Linear(dim * 2, dim, bias = False) if needs_skip_proj else None
+            skip_proj = Linear(dim * 2, dim, bias = False) if needs_skip_proj else None
 
             self.layers.append(ModuleList([
                 skip_proj,
@@ -389,7 +382,10 @@ class DurationPredictor(Module):
         transformer: dict | Transformer,
         text_num_embeds = 256,
         num_channels = None,
-        mel_spec_kwargs: dict = dict()
+        mel_spec_kwargs: dict = dict(),
+        char_embed_kwargs: dict = dict(
+            num_gateloop_layers = 2
+        )
     ):
         super().__init__()
 
@@ -408,12 +404,12 @@ class DurationPredictor(Module):
         dim = transformer.dim
         self.dim = dim
 
-        self.proj_in = nn.Linear(self.num_channels, self.dim)
+        self.proj_in = Linear(self.num_channels, self.dim)
 
-        self.embed_text = CharacterEmbed(dim, num_embeds = text_num_embeds)
+        self.embed_text = CharacterEmbed(dim, num_embeds = text_num_embeds, **char_embed_kwargs)
 
-        self.to_pred = nn.Sequential(
-            nn.Linear(dim, 1, bias = False),
+        self.to_pred = Sequential(
+            Linear(dim, 1, bias = False),
             nn.Softplus(),
             Rearrange('... 1 -> ...')
         )
@@ -444,7 +440,7 @@ class DurationPredictor(Module):
                 text = list_str_to_tensor(text).to(device)
                 assert text.shape[0] == batch
 
-            x = self.embed_text(x, text)
+            x = self.embed_text(x, x, text)
 
         # handle lengths (duration)
 
@@ -494,8 +490,10 @@ class E2TTS(Module):
         cond_drop_prob = 0.25,
         num_channels = None,
         mel_spec_module: Module | None = None,
+        char_embed_kwargs: dict = dict(
+            num_gateloop_layers = 2
+        ),
         mel_spec_kwargs: dict = dict(),
-        immiscible = False,
         frac_lengths_mask: Tuple[float, float] = (0.7, 1.)
     ):
         super().__init__()
@@ -516,7 +514,7 @@ class E2TTS(Module):
 
         self.frac_lengths_mask = frac_lengths_mask
 
-        self.embed_text = CharacterEmbed(dim, num_embeds = text_num_embeds, cond_drop_prob = cond_drop_prob)
+        self.embed_text = CharacterEmbed(dim, num_embeds = text_num_embeds, cond_drop_prob = cond_drop_prob, **char_embed_kwargs)
 
         self.duration_predictor = duration_predictor
 
@@ -535,13 +533,9 @@ class E2TTS(Module):
  
         self.num_channels = num_channels
 
-        self.proj_in = nn.Linear(num_channels, dim)
-        self.cond_proj_in = nn.Linear(num_channels, dim)
-        self.to_pred = nn.Linear(dim, num_channels)
-
-        # immiscible (diffusion / flow)
-
-        self.immiscible = immiscible
+        self.proj_in = Linear(num_channels, dim)
+        self.cond_proj_in = Linear(num_channels, dim)
+        self.to_pred = Linear(dim, num_channels)
 
     @property
     def device(self):
@@ -594,8 +588,8 @@ class E2TTS(Module):
         text: Int['b n'] | List[str] | None = None,
         lens: Int['b'] | None = None,
         duration: int | Int['b'] | None = None,
-        steps = 3,
-        cfg_strength = 1.,   # they used a classifier free guidance strenght of 1.
+        steps = 32,
+        cfg_strength = 1.,   # they used a classifier free guidance strength of 1.
         max_duration = 4096, # in case the duration predictor goes haywire
         vocoder: Callable[Float['b d n'], Float['b nw']] | None = None
     ):
@@ -610,16 +604,20 @@ class E2TTS(Module):
 
         batch, cond_seq_len, device = *cond.shape[:2], cond.device
 
+        if not exists(lens):
+            lens = torch.full((batch,), cond_seq_len, device = device, dtype = torch.long)
+
         # text
 
         if isinstance(text, list):
             text = list_str_to_tensor(text).to(device)
             assert text.shape[0] == batch
 
-        # duration
+        if exists(text):
+            text_lens = (text != -1).sum(dim = -1)
+            lens = torch.maximum(text_lens, lens) # make sure lengths are at least those of the text characters
 
-        if not exists(lens):
-            lens = torch.full((batch,), cond_seq_len, device = device, dtype = torch.long)
+        # duration
 
         cond_mask = lens_to_mask(lens)
 
@@ -628,14 +626,14 @@ class E2TTS(Module):
                 duration = torch.full((batch,), duration, device = device, dtype = torch.long)
 
         elif exists(self.duration_predictor):
-            duration = self.duration_predictor(cond, lens = lens).long()
+            duration = self.duration_predictor(cond, text = text, lens = lens).long()
 
         duration = torch.maximum(lens + 1, duration) # just add one token so something is generated
         duration = duration.clamp(max = max_duration)
         max_duration = duration.amax()
 
         cond = F.pad(cond, (0, 0, 0, max_duration - cond_seq_len), value = 0.)
-        cond_mask = F.pad(cond_mask, (0, max_duration - cond_seq_len), value = False)
+        cond_mask = F.pad(cond_mask, (0, max_duration - cond_mask.shape[-1]), value = False)
         cond_mask = rearrange(cond_mask, '... -> ... 1')
 
         mask = lens_to_mask(duration)
@@ -737,14 +735,6 @@ class E2TTS(Module):
 
         x0 = torch.randn_like(x1)
 
-        # whether to use immiscible flow
-
-        if self.immiscible:
-            cost = torch.cdist(x1.flatten(1), x0.flatten(1))
-            _, reorder_indices = linear_sum_assignment(cost.cpu())
-            reorder_indices = from_numpy(reorder_indices).to(cost.device)
-            x0 = x0[reorder_indices]
-
         # t is random times from above
 
         times = torch.rand((batch,), dtype = dtype, device = self.device)
@@ -760,14 +750,12 @@ class E2TTS(Module):
 
         cond = torch.where(
             rand_span_mask[..., None],
-            torch.zeros_like(x1),
-            x1
+            torch.zeros_like(x1), x1
         )
 
         # transformer and prediction head
 
         pred = self.transformer_with_pred_head(w, cond, times = times, text = text)
-        
         # flow matching loss
 
         loss = F.mse_loss(pred, flow, reduction = 'none')
