@@ -4,6 +4,10 @@ import json
 import os
 from pathlib import Path
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+# import matplotlib
+# matplotlib.use("Agg")
+# import matplotlib.pylab as plt
 
 import torch
 import torch.nn.functional as F
@@ -14,9 +18,10 @@ from torch.optim.lr_scheduler import LinearLR, SequentialLR
 import torchaudio
 
 from einops import rearrange
-from accelerate import Accelerator
 
-import matplotlib.pyplot as plt
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
+
 
 from ema_pytorch import EMA
 
@@ -33,6 +38,19 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+# plot spectrogram 
+def plot_spectrogram(spectrogram):
+    fig, ax = plt.subplots(figsize=(10, 4))
+    im = ax.imshow(spectrogram.T, aspect="auto", origin="lower", interpolation="none")
+    plt.colorbar(im, ax=ax)
+    plt.xlabel("Frames")
+    plt.ylabel("Channels")
+    plt.tight_layout()
+
+    fig.canvas.draw()
+    plt.close()
+    return fig
 
 # collation
 
@@ -236,8 +254,12 @@ class E2Trainer:
     ):
         # logger.add(log_file)
 
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters = True)
+
         self.accelerator = Accelerator(
-            gradient_accumulation_steps=grad_accumulation_steps,
+            # log_with = "all",
+            kwargs_handlers = [ddp_kwargs],
+            gradient_accumulation_steps = grad_accumulation_steps,
             **accelerate_kwargs
         )
 
@@ -337,7 +359,7 @@ class E2Trainer:
                         dur_loss = self.duration_predictor(mel_spec, lens=batch.get('durations'))
                         self.writer.add_scalar('duration loss', dur_loss.item(), global_step)
 
-                    loss, pred, mask, flow = self.model(mel_spec, text=text_inputs, lens=mel_lengths)
+                    loss, cond, pred, flow, mask = self.model(mel_spec, text=text_inputs, lens=mel_lengths)
                     self.accelerator.backward(loss)
 
                     if self.max_grad_norm > 0:
@@ -386,6 +408,9 @@ class E2Trainer:
                 
                 if global_step % save_step == 0:
                     self.save_checkpoint(global_step)
+                    # self.writer.add_figure("mel/target", plot_spectrogram(mel_spec[0,:,:].detach().cpu().numpy()), global_step)
+                    # self.writer.add_figure("mel/mask", plot_spectrogram(cond[0,:,:].detach().cpu().numpy()), global_step)
+                    # self.writer.add_figure("mel/prediction", plot_spectrogram(pred[0,:,:].detach().cpu().numpy()), global_step)
             
             epoch_loss /= len(train_dataloader)
             if self.accelerator.is_local_main_process:
