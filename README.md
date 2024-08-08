@@ -47,8 +47,8 @@ e2tts = E2TTS(
     ),
 )
 
-loss = e2tts(mel, text = text)
-loss.backward()
+out = e2tts(mel, text = text)
+out.loss.backward()
 
 sampled = e2tts.sample(mel[:, :5], text = text)
 
@@ -66,11 +66,10 @@ sampled = e2tts.sample(mel[:, :5], text = text)
 ```
 
 ```bibtex
-@inproceedings{Li2024ImmiscibleDA,
-    title   = {Immiscible Diffusion: Accelerating Diffusion Training with Noise Assignment},
-    author  = {Yiheng Li and Heyang Jiang and Akio Kodaira and Masayoshi Tomizuka and Kurt Keutzer and Chenfeng Xu},
-    year    = {2024},
-    url     = {https://api.semanticscholar.org/CorpusID:270562607}
+@inproceedings{Darcet2023VisionTN,
+    title   = {Vision Transformers Need Registers},
+    author  = {Timoth'ee Darcet and Maxime Oquab and Julien Mairal and Piotr Bojanowski},
+    year    = {2023},
+    url     = {https://api.semanticscholar.org/CorpusID:263134283}
 }
 ```
-

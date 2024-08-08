@@ -494,7 +494,7 @@ class E2Trainer:
                     loss, pred, flow, w, mask = self.model(mel_spec, text = phone_inputs, lens = mel_lengths, times_scale = times_scale)
                     self.accelerator.backward(loss)
 
-                    if self.max_grad_norm > 0:
+                    if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
                     self.optimizer.step()
