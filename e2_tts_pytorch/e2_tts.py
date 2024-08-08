@@ -694,7 +694,8 @@ class E2TTS(Module):
         *,
         text: Int['b nt'] | List[str] | None = None,
         times: Int['b'] | None = None,
-        lens: Int['b'] | None = None,
+        times_scale: Float | None = None,
+        lens: Int['b'] | None = None
     ):
         # handle raw wave
 
@@ -740,6 +741,10 @@ class E2TTS(Module):
         # t is random times from above
 
         times = torch.rand((batch,), dtype = dtype, device = self.device)
+
+        if exists(times_scale):
+            times = times * max(1e-3, times_scale)
+        
         t = rearrange(times, 'b -> b 1 1')
 
         # sample xt (w in the paper)
@@ -764,4 +769,4 @@ class E2TTS(Module):
 
         loss = loss[rand_span_mask]
 
-        return loss.mean(), cond.detach(), pred.detach(), flow.detach(), rand_span_mask
+        return loss.mean(), pred.detach(), flow.detach(), w.detach(), rand_span_mask

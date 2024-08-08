@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 
 import torch
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
 # from torch.utils.tensorboard import SummaryWriter
@@ -69,12 +70,17 @@ def collate_fn(batch):
 
     text = [item['text'] for item in batch]
     text_lengths = torch.LongTensor([len(item) for item in text])
+    
+    phones = [item['phones'] for item in batch]
+    phones_lengths = torch.LongTensor([len(item) for item in phones])
 
     return dict(
         mel = mel_specs,
         mel_lengths = mel_lengths,
         text = text,
         text_lengths = text_lengths,
+        phones = phones,
+        phones_lengths = phones_lengths
     )
 
 # dataset
@@ -126,49 +132,147 @@ class HFDataset(Dataset):
             text = text,
         )
 
+phone_to_token = {
+    ' ': 0,
+    '!': 1,
+    "'": 2,
+    ',': 3,
+    '-': 4,
+    '.': 5,
+    '..': 6,
+    '...': 7,
+    '?': 8,
+    'AA0': 9,
+    'AA1': 10,
+    'AA2': 11,
+    'AE0': 12,
+    'AE1': 13,
+    'AE2': 14,
+    'AH0': 15,
+    'AH1': 16,
+    'AH2': 17,
+    'AO0': 18,
+    'AO1': 19,
+    'AO2': 20,
+    'AW0': 21,
+    'AW1': 22,
+    'AW2': 23,
+    'AY0': 24,
+    'AY1': 25,
+    'AY2': 26,
+    'B': 27,
+    'CH': 28,
+    'D': 29,
+    'DH': 30,
+    'EH0': 31,
+    'EH1': 32,
+    'EH2': 33,
+    'ER0': 34,
+    'ER1': 35,
+    'ER2': 36,
+    'EY0': 37,
+    'EY1': 38,
+    'EY2': 39,
+    'F': 40,
+    'G': 41,
+    'HH': 42,
+    'IH0': 43,
+    'IH1': 44,
+    'IH2': 45,
+    'IY0': 46,
+    'IY1': 47,
+    'IY2': 48,
+    'JH': 49,
+    'K': 50,
+    'L': 51,
+    'M': 52,
+    'N': 53,
+    'NG': 54,
+    'OW0': 55,
+    'OW1': 56,
+    'OW2': 57,
+    'OY0': 58,
+    'OY1': 59,
+    'OY2': 60,
+    'P': 61,
+    'R': 62,
+    'S': 63,
+    'SH': 64,
+    'T': 65,
+    'TH': 66,
+    'UH0': 67,
+    'UH1': 68,
+    'UH2': 69,
+    'UW0': 70,
+    'UW1': 71,
+    'UW2': 72,
+    'V': 73,
+    'W': 74,
+    'Y': 75,
+    'Z': 76,
+    'ZH': 77
+}
+
+def tokenize_phonemes(text):
+    tokens = []
+    phones = [' ' if x == "*" else x for x in text.replace("   ", " * ").split(' ')]
+    
+    for phone in phones:
+        tokens.append(phone_to_token[phone])
+    
+    return torch.LongTensor(tokens)
 
 class TextAudioDataset(Dataset):
     def __init__(
         self,
         folder,
-        audio_extension = ".wav",
+        audio_extensions = ["wav", "flac"],
         target_sample_rate = 24_000,
         min_duration = 0.3,
-        max_duration = 10
+        max_duration = None
     ):
         super().__init__()
         path = Path(folder)
         assert path.exists(), 'folder does not exist'
 
-        self.audio_extension = audio_extension
+        self.audio_extensions = audio_extensions
 
-        files = list(path.glob(f'**/*{audio_extension}'))
+        files = []
+        for audio_extension in audio_extensions:
+            files.extend(list(path.glob(f'**/*.{audio_extension}')))
         assert len(files) > 0, 'no files found'
         
         valid_files = []
         
-        if os.path.exists(f'valid_files_{int(max_duration)}.json'):
-            with open(f'valid_files_{int(max_duration)}.json', 'r') as f:
-                valid_files = json.load(f)
-                valid_files = [Path(file) for file in valid_files]
-                print(f"Loaded {len(valid_files)} files.")
+        if max_duration is None:
+            valid_files = files
         else:
-            for file in tqdm(files):
-                audio, sample_rate = torchaudio.load(file)
-                duration = audio.shape[-1] / sample_rate
-
-                if duration > max_duration or duration < min_duration:
-                    pass
-                    # print(f"Skipping due to duration out of bound: {duration}")
-                else:
-                    valid_files.append(file)
+            if os.path.exists(f'valid_files_{int(max_duration)}.json'):
+                with open(f'valid_files_{int(max_duration)}.json', 'r') as f:
+                    valid_files = json.load(f)
+                    valid_files = [Path(file) for file in valid_files]
+                    print(f"Loaded {len(valid_files)} files.")
+            else:
+                for file in tqdm(files):
+                    try:
+                        audio, sample_rate = torchaudio.load(file)
+                        duration = audio.shape[-1] / sample_rate
+    
+                        if duration > max_duration or duration < min_duration:
+                            pass
+                            # print(f"Skipping due to duration out of bound: {duration}")
+                        else:
+                            valid_files.append(file)
+                    except:
+                        pass
         
-        files = valid_files
+            files = valid_files
+        
+            # save the valid file listing to json
+            with open(f'valid_files_{int(max_duration)}.json', 'w') as f:
+                json.dump([str(file) for file in files], f)
+        
         print(f"Using {len(files)} files.")
-        
-        # save the valid file listing to json
-        with open(f'valid_files_{int(max_duration)}.json', 'w') as f:
-            json.dump([str(file) for file in files], f)
         
         self.files = files
         self.target_sample_rate = target_sample_rate
@@ -181,15 +285,22 @@ class TextAudioDataset(Dataset):
         )
         
         # preprocess the data as needed
-        text = []
-        for file in tqdm(files):
-            self.save_melspec(file)
+        # text = []
+        # phones = []
+        # for file in tqdm(files):
+            # self.save_melspec(file)
             
-            text_file = file.with_suffix('.normalized.txt')
-            assert text_file.exists(), f'text file {text_file} does not exist'
-            text.append(text_file.read_text().strip())
+            # text_file = file.with_suffix('.normalized.txt')
+            # assert text_file.exists(), f'text file {text_file} does not exist'
+            # text.append(text_file.read_text().strip())
             
-        self.text = text
+            # phn_file = file.with_suffix('.phn.txt')
+            # assert phn_file.exists(), f'text file {phn_file} does not exist'
+            # phn = phn_file.read_text().strip()
+            # phones.append(tokenize_phonemes(phn))
+            
+        # self.text = text
+        # self.phones = phones
         
     def save_melspec(self, file):
         mel_file = file.with_suffix('.mel')
@@ -222,16 +333,25 @@ class TextAudioDataset(Dataset):
         
         # mel_spec = self.mel_spectrogram(audio_tensor)
         # mel_spec = rearrange(mel_spec, '1 d t -> d t')
+
+        if not os.path.exists(file.with_suffix('.mel')):
+            self.save_melspec(file)
         
         mel_spec = torch.load(file.with_suffix('.mel'), weights_only = True)
         
         # load the text file with .normalized.txt as the extension
-        # text_file = file.with_suffix('.normalized.txt')
-        # text = text_file.read_text().strip()
+        text_file = file.with_suffix('.normalized.txt')
+        text = text_file.read_text().strip()
+        
+        phn_file = file.with_suffix('.phn.txt')
+        # assert phn_file.exists(), f'text file {phn_file} does not exist'
+        phn = phn_file.read_text().strip()
+        phones = tokenize_phonemes(phn)
 
         return dict(
             mel_spec = mel_spec,
-            text = self.text[idx],
+            text = text, # self.text[idx],
+            phones = phones # self.phones[idx]
         )
 
 # trainer
@@ -242,6 +362,7 @@ class E2Trainer:
         model: E2TTS,
         optimizer,
         num_warmup_steps = 20000,
+        num_times_scale_steps = 5000,
         grad_accumulation_steps=1,
         duration_predictor: DurationPredictor | None = None,
         checkpoint_path = None,
@@ -267,18 +388,19 @@ class E2Trainer:
 
         self.model = model
 
-        if self.is_main:
-            self.ema_model = EMA(
-                model,
-                include_online_model = False,
-                **ema_kwargs
-            )
+        # if self.is_main:
+            # self.ema_model = EMA(
+            #     model,
+            #     include_online_model = False,
+            #     **ema_kwargs
+            # )
 
-            self.ema_model.to(self.accelerator.device)
+            # self.ema_model.to(self.accelerator.device)
 
         self.duration_predictor = duration_predictor
         self.optimizer = optimizer
         self.num_warmup_steps = num_warmup_steps
+        self.num_times_scale_steps = num_times_scale_steps
         self.checkpoint_path = default(checkpoint_path, 'model.pth')
         self.mel_spectrogram = MelSpec(sampling_rate=self.target_sample_rate)
 
@@ -299,7 +421,7 @@ class E2Trainer:
             checkpoint = dict(
                 model_state_dict = self.accelerator.unwrap_model(self.model).state_dict(),
                 optimizer_state_dict = self.accelerator.unwrap_model(self.optimizer).state_dict(),
-                ema_model_state_dict = self.ema_model.state_dict(),
+                # ema_model_state_dict = self.ema_model.state_dict(),
                 scheduler_state_dict = self.scheduler.state_dict(),
                 step = step
             )
@@ -312,14 +434,14 @@ class E2Trainer:
 
         checkpoint = torch.load(self.checkpoint_path)
         self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint['model_state_dict'])
-        self.accelerator.unwrap_model(self.optimizer).load_state_dict(checkpoint['optimizer_state_dict'])
+        # self.accelerator.unwrap_model(self.optimizer).load_state_dict(checkpoint['optimizer_state_dict'])
 
-        if self.is_main:
-            self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
+        # if self.is_main:
+        #     self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
 
-        if self.scheduler:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        return checkpoint['step']
+        # if self.scheduler:
+        #     self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        return 0 # checkpoint['step']
 
     def train(self, train_dataset, epochs, batch_size, num_workers=12, save_step=1000):
         train_dataloader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=collate_fn, shuffle=True, num_workers=num_workers, pin_memory=True)
@@ -351,7 +473,11 @@ class E2Trainer:
 
             for batch in progress_bar:
                 with self.accelerator.accumulate(self.model):
-                    text_inputs = batch['text']
+                    # text_inputs = batch['text']
+                    
+                    phone_inputs = batch['phones']
+                    phone_inputs = pad_sequence(phone_inputs, padding_value = 0, batch_first = True)
+                    
                     mel_spec = rearrange(batch['mel'], 'b d n -> b n d')
                     mel_lengths = batch["mel_lengths"]
 
@@ -359,7 +485,13 @@ class E2Trainer:
                         dur_loss = self.duration_predictor(mel_spec, lens=batch.get('durations'))
                         self.writer.add_scalar('duration loss', dur_loss.item(), global_step)
 
-                    loss, cond, pred, flow, mask = self.model(mel_spec, text=text_inputs, lens=mel_lengths)
+                    if global_step < self.num_times_scale_steps:
+                        scale_progress = float(global_step) / float(self.num_times_scale_steps)
+                        times_scale = max(0.0, min(1e-3, scale_progress))
+                    else:
+                        times_scale = None
+
+                    loss, pred, flow, w, mask = self.model(mel_spec, text = phone_inputs, lens = mel_lengths, times_scale = times_scale)
                     self.accelerator.backward(loss)
 
                     if self.max_grad_norm > 0:
@@ -369,8 +501,8 @@ class E2Trainer:
                     self.scheduler.step()
                     self.optimizer.zero_grad()
 
-                if self.is_main:
-                    self.ema_model.update()
+                # if self.is_main:
+                #     self.ema_model.update()
 
                 self.accelerator.log({'loss': loss.item(), 'lr': self.scheduler.get_last_lr()[0]}, step = global_step)
 
@@ -383,15 +515,25 @@ class E2Trainer:
                     mask = mask * 0.5
                     
                     # visualize the mask
-                    plt.figure(figsize=(12, 4))
-                    plt.imshow(mask, origin='lower', aspect='auto', alpha=0.5)
+                    plt.figure(figsize=(12, 1))
+                    plt.imshow(mask, origin='lower', aspect='auto')
                     plt.colorbar()
+                    plt.tight_layout()
                     plt.show()
-                    
+
+                    # visualize the noised speech
+                    w = rearrange(w[0, :].cpu(), 'n d -> d n')
+                    plt.figure(figsize=(12, 4))
+                    plt.imshow(w.numpy(), origin='lower', aspect='auto')
+                    plt.colorbar()
+                    plt.tight_layout()
+                    plt.show()
+
                     # visualize the mel spectrogram
                     plt.figure(figsize=(12, 4))
                     plt.imshow(predicted.numpy(), origin='lower', aspect='auto')
                     plt.colorbar()
+                    plt.tight_layout()
                     plt.show()
                     
                     expected = rearrange(flow[0, :].cpu(), 'n d -> d n')
@@ -400,6 +542,7 @@ class E2Trainer:
                     plt.figure(figsize=(12, 4))
                     plt.imshow(expected.numpy(), origin='lower', aspect='auto')
                     plt.colorbar()
+                    plt.tight_layout()
                     plt.show()
 
                 global_step += 1
