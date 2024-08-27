@@ -38,7 +38,7 @@ from x_transformers import (
 
 from x_transformers.x_transformers import RotaryEmbedding
 
-from gateloop_transformer import SimpleGateLoopLayer
+# from gateloop_transformer import SimpleGateLoopLayer
 
 from e2_tts_pytorch.tensor_typing import (
     Float,
@@ -48,7 +48,7 @@ from e2_tts_pytorch.tensor_typing import (
 
 # constants
 
-E2TTSReturn = namedtuple('E2TTS', ['loss', 'cond', 'pred'])
+E2TTSReturn = namedtuple('E2TTS', ['loss', 'cond', 'pred', 'flow', 'w', 'mask'])
 
 # helpers
 
@@ -80,16 +80,32 @@ def list_str_to_tensor(
 
 from g2p_en import G2p
 
+extended_chars = [' ', ',', '.', '-', '!', '?', '\'', '"', '...', '..', '. .', '. . .', '. . . .', '. . . . .', '. ...', '... .', '.. ..']
+
 def get_g2p_en_encode():
     g2p = G2p()
+    
+    def get_extended_p2idx():
+        extended_p2idx = g2p.p2idx.copy()
+        
+        for p in extended_chars:
+            extended_p2idx[p] = len(extended_p2idx)
+        
+        return extended_p2idx
+
+    g2p.extended_p2idx = get_extended_p2idx()
 
     def encode(
         text: List[str],
         padding_value = -1
     ) -> Int['b nt']:
-
         phonemes = [g2p(t) for t in text]
-        list_tensors = [tensor([g2p.p2idx[p] for p in one_phoneme]) for one_phoneme in phonemes]
+        try:
+            list_tensors = [tensor([g2p.extended_p2idx[p] for p in one_phoneme]) for one_phoneme in phonemes]
+        except KeyError as e:
+            print(f"KeyError: {e}")
+            print(f"phonemes: {phonemes}")
+            raise e
         padded_tensor = pad_sequence(list_tensors, padding_value = -1, batch_first = True)
         return padded_tensor
 
@@ -346,7 +362,7 @@ class Transformer(Module):
 
             # speech related
 
-            gateloop = SimpleGateLoopLayer(dim = dim)
+            # gateloop = SimpleGateLoopLayer(dim = dim)
 
             attn_norm = rmsnorm_klass(dim)
             attn = Attention(dim = dim, heads = heads, dim_head = dim_head, dropout = dropout, **attn_kwargs)
@@ -371,7 +387,7 @@ class Transformer(Module):
             cross_condition = TextAudioCrossCondition(dim = dim, dim_text = dim_text, cond_audio_to_text = not is_last)
 
             self.layers.append(ModuleList([
-                gateloop,
+                # gateloop,
                 skip_proj,
                 attn_norm,
                 attn,
@@ -446,7 +462,7 @@ class Transformer(Module):
         # go through the layers
 
         for ind, (
-            gateloop,
+            # gateloop,
             maybe_skip_proj,
             attn_norm,
             attn,
@@ -493,7 +509,7 @@ class Transformer(Module):
 
             # associative scan
 
-            x = gateloop(x) + x
+            # x = gateloop(x) + x
 
             # attention and feedforward blocks
 
@@ -551,7 +567,7 @@ class DurationPredictor(Module):
             text_num_embeds = 256
             self.tokenizer = list_str_to_tensor
         elif tokenizer == 'phoneme_en':
-            text_num_embeds = 74
+            text_num_embeds = 74 + len(extended_chars)
             self.tokenizer = get_g2p_en_encode()
         else:
             raise ValueError(f'unknown tokenizer string {tokenizer}')
@@ -705,7 +721,7 @@ class E2TTS(Module):
             text_num_embeds = 256
             self.tokenizer = list_str_to_tensor
         elif tokenizer == 'phoneme_en':
-            text_num_embeds = 74
+            text_num_embeds = 74 + len(extended_chars)
             self.tokenizer = get_g2p_en_encode()
         else:
             raise ValueError(f'unknown tokenizer string {tokenizer}')
@@ -831,6 +847,8 @@ class E2TTS(Module):
         # neural ode
 
         def fn(t, x):
+            print(f"Predicting for t: {t}")
+            
             # at each step, conditioning is fixed
 
             step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
@@ -946,4 +964,4 @@ class E2TTS(Module):
 
         loss = loss[rand_span_mask].mean()
 
-        return E2TTSReturn(loss, cond, pred)
+        return E2TTSReturn(loss, cond, pred.detach(), flow, w, rand_span_mask)
