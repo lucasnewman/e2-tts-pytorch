@@ -264,13 +264,13 @@ class TextAudioCrossCondition(Module):
         cond_audio_to_text = True
     ):
         super().__init__()
-        self.text_to_audio = nn.Linear(dim_text, dim, bias = False)
+        self.text_to_audio = nn.Linear(dim_text + dim, dim, bias = False)
         nn.init.zeros_(self.text_to_audio.weight)
 
         self.cond_audio_to_text = cond_audio_to_text
 
         if cond_audio_to_text:
-            self.audio_to_text = nn.Linear(dim, dim_text, bias = False)
+            self.audio_to_text = nn.Linear(dim + dim_text, dim_text, bias = False)
             nn.init.zeros_(self.audio_to_text.weight)
 
     def forward(
@@ -278,8 +278,10 @@ class TextAudioCrossCondition(Module):
         audio: Float['b n d'],
         text: Float['b n dt']
     ):
-        text_cond = self.text_to_audio(text)
-        audio_cond = self.audio_to_text(audio) if self.cond_audio_to_text else 0.
+        audio_text, _ = pack((audio, text), 'b n *')
+
+        text_cond = self.text_to_audio(audio_text)
+        audio_cond = self.audio_to_text(audio_text) if self.cond_audio_to_text else 0.
 
         return audio + text_cond, text + audio_cond
 
@@ -295,6 +297,8 @@ class Transformer(Module):
         depth = 8,
         heads = 8,
         dim_head = 64,
+        text_heads = None,
+        text_dim_head = None,
         cond_on_time = True,
         skip_connect_type: Literal['add', 'concat', 'none'] = 'concat',
         abs_pos_emb = True,
@@ -319,6 +323,9 @@ class Transformer(Module):
 
         dim_text = default(dim_text, dim // 2)
         self.dim_text = dim_text
+
+        text_heads = default(text_heads, heads)
+        text_dim_head = default(text_dim_head, dim_head)
 
         self.skip_connect_type = skip_connect_type
         needs_skip_proj = skip_connect_type == 'concat'
@@ -377,7 +384,7 @@ class Transformer(Module):
             # text related
 
             text_attn_norm = RMSNorm(dim_text)
-            text_attn = Attention(dim = dim_text, heads = heads, dim_head = dim_head, dropout = dropout, **attn_kwargs)
+            text_attn = Attention(dim = dim_text, heads = text_heads, dim_head = text_dim_head, dropout = dropout, **attn_kwargs)
 
             text_ff_norm = RMSNorm(dim_text)
             text_ff = FeedForward(dim = dim_text, glu = True, dropout = dropout, **ff_kwargs)
@@ -752,6 +759,10 @@ class E2TTS(Module):
 
         x = self.proj_in(x)
         cond = self.cond_proj_in(cond)
+
+        # add the condition, given as using voicebox-like scheme
+
+        x = x + cond
 
         # whether to use a text embedding
 
