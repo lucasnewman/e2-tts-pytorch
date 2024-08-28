@@ -656,6 +656,9 @@ class DurationPredictor(Module):
 
         return F.mse_loss(pred, lens.float())
 
+def noise_schedule(t, s=0.008):
+    return t ** 2 # torch.sin((t / (1 + s) + s) * torch.pi / 2) ** 2
+    
 class E2TTS(Module):
     def __init__(
         self,
@@ -675,7 +678,8 @@ class E2TTS(Module):
         frac_lengths_mask: Tuple[float, float] = (0.7, 1.),
         immiscible = False,
         text_num_embeds = None,
-        tokenizer: str |  Callable[[List[str]], Int['b nt']] = 'char_utf8'
+        tokenizer: str |  Callable[[List[str]], Int['b nt']] = 'char_utf8',
+        use_noise_schedule = True 
     ):
         super().__init__()
 
@@ -740,10 +744,17 @@ class E2TTS(Module):
         # immiscible flow - https://arxiv.org/abs/2406.12303
 
         self.immiscible = immiscible
+        self.use_noise_schedule = use_noise_schedule
 
     @property
     def device(self):
         return next(self.parameters()).device
+
+    def sample_times(self, batch_size, dtype, device):
+        times = torch.rand((batch_size,), dtype = dtype, device = device)
+        if self.use_noise_schedule:
+            times = noise_schedule(times)
+        return times
 
     def transformer_with_pred_head(
         self,
@@ -950,6 +961,10 @@ class E2TTS(Module):
         # t is random times from above
 
         times = torch.rand((batch,), dtype = dtype, device = self.device)
+
+        if self.use_noise_schedule:
+            times = cosine_noise_schedule(times)  # Apply the noise schedule mapping
+
         t = rearrange(times, 'b -> b 1 1')
 
         # sample xt (w in the paper)
