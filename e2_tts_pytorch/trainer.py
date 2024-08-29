@@ -82,46 +82,42 @@ class HFDataset(Dataset):
         self,
         hf_dataset: Dataset,
         target_sample_rate = 24_000,
-        hop_length = 256,
-        min_duration: float = 0.3,
-        max_duration: float = 10.0
+        hop_length = 256
     ):
         self.data = hf_dataset
         self.target_sample_rate = target_sample_rate
         self.hop_length = hop_length
         self.mel_spectrogram = MelSpec(sampling_rate=target_sample_rate)
-        self.min_duration = min_duration
-        self.max_duration = max_duration
-        
-        self.iter = iter(self.data)
 
     def __len__(self):
-        return 10_000
+        return len(self.data)
     
     def __getitem__(self, index):
-        row = next(self.iter)
-        
+        row = self.data[index]
         audio = row['audio']['array']
-        sample_rate = row['audio']['sampling_rate'].float()
-        duration = float(audio.shape[0]) / sample_rate
 
-        if duration > self.max_duration or duration < self.min_duration:
-            # print(f"Skipping due to duration out of bound: {duration}")
-            return self.__getitem__(0)
-        
-        audio = row['audio']['array']
+        logger.info(f"Audio shape: {audio.shape}")
+
         sample_rate = row['audio']['sampling_rate']
+        duration = audio.shape[-1] / sample_rate
+
+        if duration > 20 or duration < 0.3:
+            logger.warning(f"Skipping due to duration out of bound: {duration}")
+            return self.__getitem__((index + 1) % len(self.data))
+        
+        audio_tensor = torch.from_numpy(audio).float()
         
         if sample_rate != self.target_sample_rate:
             resampler = torchaudio.transforms.Resample(sample_rate, self.target_sample_rate)
-            audio = resampler(audio)
+            audio_tensor = resampler(audio_tensor)
         
-        audio = rearrange(audio, 't -> 1 t')
+        audio_tensor = rearrange(audio_tensor, 't -> 1 t')
         
-        mel_spec = self.mel_spectrogram(audio)
+        mel_spec = self.mel_spectrogram(audio_tensor)
+        
         mel_spec = rearrange(mel_spec, '1 d t -> d t')
         
-        text = row['text_original']
+        text = row['transcript']
         
         return dict(
             mel_spec = mel_spec,

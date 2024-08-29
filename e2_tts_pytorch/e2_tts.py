@@ -663,7 +663,7 @@ class DurationPredictor(Module):
         return F.mse_loss(pred, lens.float())
 
 def noise_schedule(t, s=0.008):
-    return t ** 2 # torch.sin((t / (1 + s) + s) * torch.pi / 2) ** 2
+    return t ** 2
     
 class E2TTS(Module):
     def __init__(
@@ -685,7 +685,7 @@ class E2TTS(Module):
         immiscible = False,
         text_num_embeds = None,
         tokenizer: str |  Callable[[list[str]], Int['b nt']] = 'char_utf8',
-        use_noise_schedule = True
+        use_noise_schedule = False
     ):
         super().__init__()
 
