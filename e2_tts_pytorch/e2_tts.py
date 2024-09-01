@@ -38,7 +38,7 @@ from x_transformers import (
 
 from x_transformers.x_transformers import RotaryEmbedding
 
-# from gateloop_transformer import SimpleGateLoopLayer
+from gateloop_transformer import SimpleGateLoopLayer
 
 from e2_tts_pytorch.tensor_typing import (
     Float,
@@ -231,6 +231,19 @@ class AdaLNZero(Module):
         gamma = self.to_gamma(condition).sigmoid()
         return x * gamma
 
+# random projection fourier embedding
+
+class RandomFourierEmbed(Module):
+    def __init__(self, dim):
+        super().__init__()
+        assert divisible_by(dim, 2)
+        self.register_buffer('weights', torch.randn(dim // 2))
+
+    def forward(self, x):
+        freqs = einx.multiply('i, j -> i j', x, self.weights) * 2 * torch.pi
+        fourier_embed, _ = pack((x, freqs.sin(), freqs.cos()), 'b *')
+        return fourier_embed
+
 # character embedding
 
 class CharacterEmbed(Module):
@@ -297,8 +310,11 @@ class Transformer(Module):
         depth = 8,
         heads = 8,
         dim_head = 64,
+        ff_mult = 4,
+        text_depth = None,
         text_heads = None,
         text_dim_head = None,
+        text_ff_mult = None,
         cond_on_time = True,
         skip_connect_type: Literal['add', 'concat', 'none'] = 'concat',
         abs_pos_emb = True,
@@ -309,7 +325,8 @@ class Transformer(Module):
             gate_value_heads = True,
             softclamp_logits = True,
         ),
-        ff_kwargs: dict = dict()
+        ff_kwargs: dict = dict(),
+        use_gateloop = False
     ):
         super().__init__()
         assert divisible_by(depth, 2), 'depth needs to be even'
@@ -326,6 +343,10 @@ class Transformer(Module):
 
         text_heads = default(text_heads, heads)
         text_dim_head = default(text_dim_head, dim_head)
+        text_ff_mult = default(text_ff_mult, ff_mult)
+        text_depth = default(text_depth, depth)
+
+        assert 1 <= text_depth <= depth, 'must have at least 1 layer of text conditioning, but less than total number of speech layers'
 
         self.skip_connect_type = skip_connect_type
         needs_skip_proj = skip_connect_type == 'concat'
@@ -358,58 +379,68 @@ class Transformer(Module):
 
         if cond_on_time:
             self.time_cond_mlp = Sequential(
-                Rearrange('... -> ... 1'),
-                Linear(1, dim),
+                RandomFourierEmbed(dim),
+                Linear(dim + 1, dim),
                 nn.SiLU()
             )
 
         for ind in range(depth):
             is_last = ind == (depth - 1)
             is_later_half = ind >= (depth // 2)
+            has_text = ind < text_depth
 
             # speech related
 
-            # gateloop = SimpleGateLoopLayer(dim = dim)
+            gateloop = SimpleGateLoopLayer(dim = dim) if use_gateloop else None
 
             attn_norm = rmsnorm_klass(dim)
             attn = Attention(dim = dim, heads = heads, dim_head = dim_head, dropout = dropout, **attn_kwargs)
             attn_adaln_zero = postbranch_klass()
 
             ff_norm = rmsnorm_klass(dim)
-            ff = FeedForward(dim = dim, glu = True, dropout = dropout, **ff_kwargs)
+            ff = FeedForward(dim = dim, glu = True, mult = ff_mult, dropout = dropout, **ff_kwargs)
             ff_adaln_zero = postbranch_klass()
 
             skip_proj = Linear(dim * 2, dim, bias = False) if needs_skip_proj and is_later_half else None
 
-            # text related
+            text_modules = None
 
-            # text_gateloop = SimpleGateLoopLayer(dim = dim_text)
+            if has_text:
+                # text related
 
-            text_attn_norm = RMSNorm(dim_text)
-            text_attn = Attention(dim = dim_text, heads = text_heads, dim_head = text_dim_head, dropout = dropout, **attn_kwargs)
+                text_gateloop = SimpleGateLoopLayer(dim = dim_text) if use_gateloop else None
 
-            text_ff_norm = RMSNorm(dim_text)
-            text_ff = FeedForward(dim = dim_text, glu = True, dropout = dropout, **ff_kwargs)
+                text_attn_norm = RMSNorm(dim_text)
+                text_attn = Attention(dim = dim_text, heads = text_heads, dim_head = text_dim_head, dropout = dropout, **attn_kwargs)
 
-            # cross condition
+                text_ff_norm = RMSNorm(dim_text)
+                text_ff = FeedForward(dim = dim_text, glu = True, mult = text_ff_mult, dropout = dropout, **ff_kwargs)
 
-            cross_condition = TextAudioCrossCondition(dim = dim, dim_text = dim_text, cond_audio_to_text = not is_last)
+                # cross condition
+
+                cross_condition = TextAudioCrossCondition(dim = dim, dim_text = dim_text, cond_audio_to_text = not is_last)
+
+                text_modules = ModuleList([
+                    text_gateloop,
+                    text_attn_norm,
+                    text_attn,
+                    text_ff_norm,
+                    text_ff,
+                    cross_condition
+                ])
 
             self.layers.append(ModuleList([
-                # gateloop,
-                skip_proj,
-                attn_norm,
-                attn,
-                attn_adaln_zero,
-                ff_norm,
-                ff,
-                ff_adaln_zero,
-                # text_gateloop,
-                text_attn_norm,
-                text_attn,
-                text_ff_norm,
-                text_ff,
-                cross_condition
+                ModuleList([
+                    gateloop,
+                    skip_proj,
+                    attn_norm,
+                    attn,
+                    attn_adaln_zero,
+                    ff_norm,
+                    ff,
+                    ff_adaln_zero,
+                ]),
+                text_modules
             ]))
 
         self.final_norm = RMSNorm(dim)
@@ -471,29 +502,35 @@ class Transformer(Module):
 
         # go through the layers
 
-        for ind, (
-            # gateloop,
-            maybe_skip_proj,
-            attn_norm,
-            attn,
-            maybe_attn_adaln_zero,
-            ff_norm,
-            ff,
-            maybe_ff_adaln_zero,
-            # text_gateloop,
-            text_attn_norm,
-            text_attn,
-            text_ff_norm,
-            text_ff,
-            cross_condition
-        ) in enumerate(self.layers):
-
+        for ind, (speech_modules, text_modules) in enumerate(self.layers):
             layer = ind + 1
+
+            (
+                gateloop,
+                maybe_skip_proj,
+                attn_norm,
+                attn,
+                maybe_attn_adaln_zero,
+                ff_norm,
+                ff,
+                maybe_ff_adaln_zero
+            ) = speech_modules
 
             # smaller text transformer
 
-            if exists(text_embed):
-                # text_embed = text_gateloop(text_embed) + text_embed
+            if exists(text_embed) and exists(text_modules):
+
+                (
+                    text_gateloop,
+                    text_attn_norm,
+                    text_attn,
+                    text_ff_norm,
+                    text_ff,
+                    cross_condition
+                ) = text_modules
+
+                if exists(text_gateloop):
+                    text_embed = text_gateloop(text_embed) + text_embed
 
                 text_embed = text_attn(text_attn_norm(text_embed), rotary_pos_emb = text_rotary_pos_emb, mask = mask) + text_embed
 
@@ -520,9 +557,10 @@ class Transformer(Module):
                     # additive
                     x = x + skip
 
-            # associative scan
+            # maybe associative scan
 
-            # x = gateloop(x) + x
+            if exists(gateloop):
+                x = gateloop(x) + x
 
             # attention and feedforward blocks
 
