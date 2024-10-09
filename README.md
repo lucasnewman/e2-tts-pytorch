@@ -7,6 +7,8 @@ Implementation of E2-TTS, <a href="https://arxiv.org/abs/2406.18009v1">Embarrass
 
 The repository differs from the paper in that it uses a <a href="https://arxiv.org/abs/2107.10342">multistream transformer</a> for text and audio, with conditioning done every transformer block in the E2 manner.
 
+It also includes an improvisation that was proven out by Manmay, where the text is simply interpolated to the length of the audio for conditioning. You can try this by setting `interpolated_text = True` on `E2TTS`
+
 ## Appreciation
 
 - <a href="https://github.com/manmay-nakhashi">Manmay</a> for contributing <a href="https://github.com/lucidrains/e2-tts-pytorch/pull/1">working end-to-end training code</a>!
@@ -14,6 +16,8 @@ The repository differs from the paper in that it uses a <a href="https://arxiv.o
 - <a href="https://github.com/lucasnewman">Lucas Newman</a> for the code contributions, helpful feedback, and for sharing the first set of positive experiments!
 
 - <a href="https://github.com/JingRH">Jing</a> for sharing the second positive result with a multilingual (English + Chinese) dataset!
+
+- <a href="https://github.com/Coice">Coice</a> and <a href="https://github.com/manmay-nakhashi">Manmay</a> for reporting the third and fourth successful runs. Farewell alignment engineering
 
 ## Install
 
@@ -48,8 +52,7 @@ e2tts = E2TTS(
     duration_predictor = duration_predictor,
     transformer = dict(
         dim = 512,
-        depth = 8,
-        skip_connect_type = 'concat'
+        depth = 8        
     ),
 )
 
@@ -99,5 +102,14 @@ sampled = e2tts.sample(mel[:, :5], text = text)
     year      = {2021},
     volume    = {abs/2107.10342},
     url       = {https://api.semanticscholar.org/CorpusID:236171087}
+}
+```
+
+```bibtex
+@inproceedings{Sadat2024EliminatingOA,
+    title   = {Eliminating Oversaturation and Artifacts of High Guidance Scales in Diffusion Models},
+    author  = {Seyedmorteza Sadat and Otmar Hilliges and Romann M. Weber},
+    year    = {2024},
+    url     = {https://api.semanticscholar.org/CorpusID:273098845}
 }
 ```
