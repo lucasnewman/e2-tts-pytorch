@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from torch import nn, tensor, Tensor, from_numpy
 from torch.nn import Module, ModuleList, Sequential, Linear
 from torch.nn.utils.rnn import pad_sequence
+from torch.amp import autocast
 
 import torchaudio
 from torchaudio.functional import DB_to_amplitude, resample
@@ -42,7 +43,7 @@ from x_transformers import (
     AdaptiveRMSNorm,
 )
 
-from x_transformers.x_transformers import RotaryEmbedding
+# from x_transformers.x_transformers import RotaryEmbedding
 
 from vocos import Vocos
 
@@ -121,16 +122,6 @@ extended_chars = [' ', ',', '.', '-', '!', '?', '\'', '"', '...', '..', '. .', '
 
 def get_g2p_en_encode():
     g2p = G2p()
-    
-    def get_extended_p2idx():
-        extended_p2idx = g2p.p2idx.copy()
-        
-        for p in extended_chars:
-            extended_p2idx[p] = len(extended_p2idx)
-        
-        return extended_p2idx
-
-    g2p.extended_p2idx = get_extended_p2idx()
 
     # used by @lucasnewman successfully here
     # https://github.com/lucasnewman/e2-tts-pytorch/blob/ljspeech-test/e2_tts_pytorch/e2_tts.py
@@ -315,6 +306,108 @@ class RandomFourierEmbed(Module):
         fourier_embed, _ = pack((x, freqs.sin(), freqs.cos()), 'b *')
         return fourier_embed
 
+# rotary embedding
+
+
+class RotaryEmbedding(nn.Module):
+    def __init__(
+        self,
+        dim,
+        use_xpos=False,
+        scale_base=512,
+        interpolation_factor=1.,
+        base=10000,
+        base_rescale_factor=1.
+    ):
+        super().__init__()
+        # Rescale the base value based on the dimension
+        base *= base_rescale_factor ** (dim / (dim - 2))
+
+        inv_freq = 1. / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+
+        assert interpolation_factor >= 1.
+        self.interpolation_factor = interpolation_factor
+
+        if not use_xpos:
+            self.register_buffer('scale', None)
+            return
+
+        scale = (torch.arange(0, dim, 2) + 0.4 * dim) / (1.4 * dim)
+
+        self.scale_base = scale_base
+        self.register_buffer('scale', scale)
+
+    def forward_from_seq_len(self, seq_len):
+        device = self.inv_freq.device
+
+        t = torch.arange(seq_len, device=device)
+        return self.forward(t)
+
+    @autocast(device_type="cuda", enabled=False)
+    def forward(self, t):
+        max_pos = t.max() + 1
+
+        freqs = torch.einsum('i , j -> i j', t.type_as(self.inv_freq), self.inv_freq) / self.interpolation_factor
+        freqs = torch.stack((freqs, freqs), dim=-1)
+        freqs = rearrange(freqs, '... d r -> ... (d r)')
+
+        if not exists(self.scale):
+            return freqs, 1.
+
+        power = (t - (max_pos // 2)) / self.scale_base
+        scale = self.scale ** rearrange(power, 'n -> n 1')
+        scale = torch.stack((scale, scale), dim=-1)
+        scale = rearrange(scale, '... d r -> ... (d r)')
+
+        return freqs, scale
+
+    @autocast(device_type="cuda", enabled=False)
+    def forward_from_seq_len_and_scale(self, max_len, seq_scale):
+        batch_size = seq_scale.shape[0]
+        device = self.inv_freq.device
+        max_pos = max_len
+
+        pos = torch.arange(max_pos, device=device).expand(batch_size, max_pos)
+        pos = pos * rearrange(seq_scale, "b -> b 1")
+
+        freqs = torch.einsum('bi , j -> bij', pos.type_as(self.inv_freq), self.inv_freq) / self.interpolation_factor
+        freqs = torch.stack((freqs, freqs), dim=-1)
+        freqs = rearrange(freqs, 'b n d r -> b n (d r)')
+
+        if not exists(self.scale):
+            return freqs, 1.
+
+        power = (pos - (max_pos // 2)) / self.scale_base
+        scale = self.scale ** rearrange(power, 'b n -> b n 1')
+        scale = torch.stack((scale, scale), dim=-1)
+        scale = rearrange(scale, 'b n d r -> b n (d r)')
+
+        return freqs, scale
+
+def rotate_half(x):
+    x = rearrange(x, '... (d r) -> ... d r', r=2)
+    x1, x2 = x.unbind(dim=-1)
+    x = torch.stack((-x2, x1), dim=-1)
+    return rearrange(x, '... d r -> ... (d r)')
+
+@autocast(device_type="cuda", enabled=False)
+def apply_rotary_pos_emb(t, freqs, scale=1):
+    rot_dim, seq_len, orig_dtype = freqs.shape[-1], t.shape[-2], t.dtype
+
+    freqs = freqs[-seq_len:, :]
+    scale = scale[-seq_len:, :] if isinstance(scale, torch.Tensor) else scale
+
+    if t.ndim == 4 and freqs.ndim == 3:
+        freqs = rearrange(freqs, 'b n d -> b 1 n d')
+
+    # Partial rotary embeddings, Wang et al. GPT-J
+    t, t_unrotated = t[..., :rot_dim], t[..., rot_dim:]
+    t = (t * freqs.cos() * scale) + (rotate_half(t) * freqs.sin() * scale)
+    out = torch.cat((t, t_unrotated), dim=-1)
+
+    return out.type(orig_dtype)
+
 # character embedding
 
 class CharacterEmbed(Module):
@@ -447,7 +540,7 @@ class TextAudioCrossCondition(Module):
 # for use in both e2tts as well as duration module
 
 class Transformer(Module):
-    @beartype
+    # @beartype
     def __init__(
         self,
         *,
@@ -507,7 +600,7 @@ class Transformer(Module):
         # rotary embedding
 
         self.rotary_emb = RotaryEmbedding(dim_head)
-        self.text_rotary_emb = RotaryEmbedding(dim_head)
+        self.text_rotary_emb = RotaryEmbedding(text_dim_head)
 
         # time conditioning
         # will use adaptive rmsnorm
@@ -587,8 +680,10 @@ class Transformer(Module):
         self,
         x: Float['b n d'],
         times: Float['b'] | Float[''] | None = None,
+        lens: Int['b'] | None = None,
         mask: Bool['b n'] | None = None,
         text_embed: Float['b n dt'] | None = None,
+        text_lens: Int['b'] | None = None
     ):
         batch, seq_len, device = *x.shape[:2], x.device
 
@@ -621,9 +716,12 @@ class Transformer(Module):
             mask = F.pad(mask, (self.num_registers, 0), value = True)
 
         # rotary embedding
-
-        rotary_pos_emb = self.rotary_emb.forward_from_seq_len(x.shape[-2])
-
+        
+        if exists(lens) and exists(text_lens):
+            rotary_pos_emb = self.rotary_emb.forward_from_seq_len_and_scale(x.shape[-2], text_lens / lens)
+        else:
+            rotary_pos_emb = self.rotary_emb.forward_from_seq_len(x.shape[-2])
+        
         # text related
 
         if exists(text_embed):
@@ -701,7 +799,7 @@ class Transformer(Module):
 # main classes
 
 class DurationPredictor(Module):
-    @beartype
+    # @beartype
     def __init__(
         self,
         transformer: dict | Transformer,
@@ -831,7 +929,7 @@ def noise_schedule(t, s=0.008):
     
 class E2TTS(Module):
 
-    @beartype
+    # @beartype
     def __init__(
         self,
         transformer: dict | Transformer = None,
@@ -843,6 +941,7 @@ class E2TTS(Module):
         ),
         cond_drop_prob = 0.25,
         num_channels = None,
+        num_experts = 1,
         mel_spec_module: Module | None = None,
         char_embed_kwargs: dict = dict(),
         mel_spec_kwargs: dict = dict(),
@@ -860,19 +959,29 @@ class E2TTS(Module):
     ):
         super().__init__()
 
-        if isinstance(transformer, dict):
-            transformer = Transformer(
-                **transformer,
-                cond_on_time = True
-            )
+        # if isinstance(transformer, dict):
+        #     transformer = Transformer(
+        #         **transformer,
+        #         cond_on_time = True
+        #     )
 
         if isinstance(duration_predictor, dict):
             duration_predictor = DurationPredictor(**duration_predictor)
+            
+        experts = []
+        for _ in range(num_experts):
+            if isinstance(transformer, dict):
+                experts.append(
+                    Transformer(**transformer, cond_on_time = True)
+                )
+            else:
+                raise ValueError('`transformer` must be a dictionary')
+        
+        self.experts = ModuleList(experts)
+        self.num_experts = num_experts
 
-        self.transformer = transformer
-
-        dim = transformer.dim
-        dim_text = transformer.dim_text
+        dim = experts[0].dim
+        dim_text = experts[0].dim_text
 
         self.dim = dim
         self.dim_text = dim_text
@@ -936,17 +1045,13 @@ class E2TTS(Module):
     def device(self):
         return next(self.parameters()).device
 
-    def sample_times(self, batch_size, dtype, device):
-        times = torch.rand((batch_size,), dtype = dtype, device = device)
-        if self.use_noise_schedule:
-            times = noise_schedule(times)
-        return times
-
     def transformer_with_pred_head(
         self,
+        transformer: Transformer,
         x: Float['b n d'],
         cond: Float['b n d'],
         times: Float['b'],
+        lens: Int['b'] | None = None,
         mask: Bool['b n'] | None = None,
         text: Int['b nt'] | None = None,
         drop_text_cond: bool | None = None
@@ -970,16 +1075,20 @@ class E2TTS(Module):
         # whether to use a text embedding
 
         text_embed = None
+        text_lens = None
         if exists(text) and not drop_text_cond:
+            text_lens = (text != -1).sum(dim = -1)
             text_embed = self.embed_text(text, seq_len, mask = mask)
 
         # attend
 
-        attended = self.transformer(
+        attended = transformer(
             x,
             times = times,
             mask = mask,
-            text_embed = text_embed
+            lens = lens,
+            text_embed = text_embed,
+            text_lens = text_lens
         )
 
         return self.to_pred(attended)
@@ -988,7 +1097,7 @@ class E2TTS(Module):
         self,
         *args,
         cfg_strength: float = 1.,
-        remove_parallel_component: bool = True,
+        remove_parallel_component: bool = False,
         keep_parallel_frac: float = 0.,
         **kwargs,
     ):
@@ -1086,7 +1195,11 @@ class E2TTS(Module):
 
             # predict flow
 
+            expert_ind = (t * self.num_experts).long().clamp(0, self.num_experts - 1)
+            expert = self.experts[expert_ind]
+            
             return self.cfg_transformer_with_pred_head(
+                expert,
                 x,
                 step_cond,
                 times = t,
@@ -1198,9 +1311,6 @@ class E2TTS(Module):
 
         times = torch.rand((batch,), dtype = dtype, device = self.device)
 
-        if self.use_noise_schedule:
-            times = noise_schedule(times)
-
         t = rearrange(times, 'b -> b 1 1')
 
         # sample xt (w in the paper)
@@ -1216,15 +1326,34 @@ class E2TTS(Module):
             rand_span_mask,
             torch.zeros_like(x1), x1
         )
-
+        
+        # route times to experts
+        
+        expert_ind = (times * self.num_experts).long().clamp(0, self.num_experts - 1)
+        
         # transformer and prediction head
-
-        pred = self.transformer_with_pred_head(w, cond, times = times, text = text, mask = mask)
-
+        
+        pred = torch.zeros_like(flow, device = self.device)
+        
+        for i, expert in enumerate(self.experts):
+            expert_mask = (expert_ind == i)
+            if expert_mask.any():
+                output = self.transformer_with_pred_head(
+                    expert,
+                    w[expert_mask],
+                    cond[expert_mask],
+                    times = times[expert_mask],
+                    lens = lens[expert_mask],
+                    text = text[expert_mask],
+                    mask = mask[expert_mask]
+                )
+                pred = pred.to(output.dtype)
+                pred[expert_mask] = output
+        
         # flow matching loss
 
         loss = F.mse_loss(pred, flow, reduction = 'none')
 
         loss = loss[rand_span_mask].mean()
 
-        return E2TTSReturn(loss, cond, pred, x0 + pred, flow, w, rand_span_mask)
+        return E2TTSReturn(loss, cond, pred.detach(), x0 + pred.detach(), flow, w, rand_span_mask)

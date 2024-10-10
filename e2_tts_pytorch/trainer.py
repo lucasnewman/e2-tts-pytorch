@@ -60,6 +60,9 @@ def collate_fn(batch):
     mel_specs = [item['mel_spec'].squeeze(0) for item in batch]
     mel_lengths = torch.LongTensor([spec.shape[-1] for spec in mel_specs])
     max_mel_length = mel_lengths.amax()
+    
+    # round to nearest multiple of 128
+    max_mel_length = ((max_mel_length + 511) // 512) * 512
 
     padded_mel_specs = []
     for spec in mel_specs:
@@ -260,14 +263,14 @@ class E2Trainer:
 
         self.model = model
 
-        # if self.is_main:
-        #     self.ema_model = EMA(
-        #         model,
-        #         include_online_model = False,
-        #         **ema_kwargs
-        #     )
+        if self.is_main:
+            self.ema_model = EMA(
+                model,
+                include_online_model = False,
+                **ema_kwargs
+            )
 
-        #     self.ema_model.to(self.accelerator.device)
+            self.ema_model.to(self.accelerator.device)
 
         self.duration_predictor = duration_predictor
         self.optimizer = optimizer
@@ -294,7 +297,7 @@ class E2Trainer:
             checkpoint = dict(
                 model_state_dict = self.accelerator.unwrap_model(self.model).state_dict(),
                 optimizer_state_dict = self.accelerator.unwrap_model(self.optimizer).state_dict(),
-                # ema_model_state_dict = self.ema_model.state_dict(),
+                ema_model_state_dict = self.ema_model.state_dict(),
                 scheduler_state_dict = self.scheduler.state_dict(),
                 step = step
             )
@@ -309,8 +312,8 @@ class E2Trainer:
         self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint['model_state_dict'])
         self.accelerator.unwrap_model(self.optimizer).load_state_dict(checkpoint['optimizer_state_dict'])
 
-        # if self.is_main:
-        #     self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
+        if self.is_main:
+            self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
 
         if self.scheduler:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -362,8 +365,8 @@ class E2Trainer:
                     self.scheduler.step()
                     self.optimizer.zero_grad()
 
-                # if self.is_main:
-                #     self.ema_model.update()
+                if self.is_main:
+                    self.ema_model.update()
 
                 self.accelerator.log({'loss': loss.item(), 'lr': self.scheduler.get_last_lr()[0]}, step = global_step)
 
